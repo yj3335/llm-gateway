@@ -1,0 +1,31 @@
+# Single-node Redis for demos. Use a managed/HA Redis (ElastiCache, Memorystore,
+# Redis Cluster) in production; the rate-limit Lua keys use {tenant} hash tags
+# so they are Redis-Cluster safe.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: llm-gateway
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+          ports: [{ containerPort: 6379 }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 768Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: llm-gateway
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]

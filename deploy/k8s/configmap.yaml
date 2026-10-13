@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-gateway-config
+  namespace: llm-gateway
+data:
+  gateway.yaml: |
+    server:
+      addr: ":8080"
+      read_timeout: 30s
+      write_timeout: 120s
+      cors_origins: ["https://gateway-ui.example.com"]
+      enable_chaos_headers: false
+    auth:
+      issuer: "llm-gateway"
+      audience: "llm-gateway"
+      dev_token_endpoint: false
+      api_key_cache_ttl: 60s
+      default_rpm: 600
+      default_tpm: 200000
+      default_pii_mode: REDACT
+    redis:
+      addr: "redis.llm-gateway.svc.cluster.local:6379"
+      pool_size: 256
+      dial_timeout: 500ms
+      op_timeout: 250ms
+    postgres:
+      max_conns: 32
+      min_conns: 16
+      run_migrations: true
+      hnsw_ef_search: 40
+    ratelimit: { enabled: true, default_max_tokens: 256 }
+    guardrails: { enabled: true, injection_threshold: 0.7, scan_output: true }
+    cache:
+      enabled: true
+      similarity_threshold: 0.86
+      ttl: 24h
+      l1_max_entries: 50000
+      embedder: hashing
+      write_queue_size: 8192
+      write_workers: 8
+    providers:
+      - { name: openai,    type: openai,    base_url: "https://api.openai.com",                    api_key_env: OPENAI_API_KEY,    timeout: 30s, default_model: gpt-4o-mini }
+      - { name: anthropic, type: anthropic, base_url: "https://api.anthropic.com",                 api_key_env: ANTHROPIC_API_KEY, timeout: 30s, default_model: claude-3-5-haiku-latest }
+      - { name: gemini,    type: gemini,    base_url: "https://generativelanguage.googleapis.com", api_key_env: GEMINI_API_KEY,    timeout: 30s, default_model: gemini-2.0-flash }
+      - { name: ollama,    type: ollama,    base_url: "http://ollama.llm-gateway.svc.cluster.local:11434", timeout: 60s, default_model: llama3.1 }
+    routes:
+      - { match: "gpt-*",    targets: [{ provider: openai }, { provider: anthropic, model: claude-3-5-haiku-latest }] }
+      - { match: "claude-*", targets: [{ provider: anthropic }, { provider: openai, model: gpt-4o-mini }] }
+      - { match: "gemini-*", targets: [{ provider: gemini }, { provider: openai, model: gpt-4o-mini }] }
+      - { match: "llama*",   targets: [{ provider: ollama }, { provider: openai, model: gpt-4o-mini }] }
+    circuit_breaker:
+      failure_rate_window: 20
+      min_requests: 10
+      failure_rate: 0.5
+      open_timeout: 5s
+      half_open_max_requests: 2
+      half_open_successes: 2
+    telemetry: { stream_interval: 1s, sample_window: 10000 }
+    pricing:
+      default: { input: 0.0025, output: 0.01 }

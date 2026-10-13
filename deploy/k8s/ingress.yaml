@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"          # required for SSE streaming
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [gateway.example.com, gateway-ui.example.com]
+      secretName: llm-gateway-tls
+  rules:
+    - host: gateway.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: llm-gateway, port: { name: http } } }
+    - host: gateway-ui.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: llm-gateway-web, port: { name: http } } }

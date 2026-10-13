@@ -1,0 +1,69 @@
+# Full local stack: Postgres (pgvector), Redis, MockLLM, Gateway, Prometheus, Web UI.
+#   docker compose up --build
+# Dashboard: http://localhost:3000   Gateway: http://localhost:8080   Prometheus: http://localhost:9090
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: llmgw
+      POSTGRES_PASSWORD: llmgw
+      POSTGRES_DB: llmgateway
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_init_pgvector.sql:/docker-entrypoint-initdb.d/001_init_pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmgw -d llmgateway"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mockllm:
+    build: { context: ., target: mockllm }
+    command: ["-addr", ":8090", "-ttft", "120ms", "-tpot", "1ms"]
+    ports: ["8090:8090"]
+
+  gateway:
+    build: { context: ., target: gateway }
+    environment:
+      LLMGW_REDIS_ADDR: redis:6379
+      LLMGW_POSTGRES_DSN: postgres://llmgw:llmgw@postgres:5432/llmgateway?sslmode=disable
+      LLMGW_MOCKLLM_URL: http://mockllm:8090
+      LLMGW_CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      LLMGW_JWT_SECRET: ${LLMGW_JWT_SECRET:-dev-insecure-change-me}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      mockllm: { condition: service_started }
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [gateway]
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
+    ports: ["3000:3000"]
+    depends_on: [gateway]
+
+volumes:
+  pgdata:

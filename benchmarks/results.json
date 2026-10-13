@@ -1,0 +1,252 @@
+{
+  "generated_at": "2026-10-13T23:47:38Z",
+  "environment": {
+    "arch": "arm64",
+    "backends": {
+      "api_keys": "postgres+l1",
+      "cache_l1": "memory+redis",
+      "cache_l2": "pgvector",
+      "embedder": "hashing-ngram-384",
+      "ratelimit": "redis-lua"
+    },
+    "cpus": 15,
+    "go": "go1.27.2",
+    "os": "darwin",
+    "topology": "gateway + mockllm + bench client in one process over loopback TCP; Redis 7.4 and PostgreSQL 16 + pgvector 0.6 on localhost"
+  },
+  "config": {
+    "concurrency": 100,
+    "fault_rate": 0.1,
+    "head_intents": 300,
+    "injection_rate": 0.02,
+    "mock_tokens": 48,
+    "mock_tpot_ms": 1,
+    "mock_ttft_ms": 120,
+    "paraphrases_per_intent": 4,
+    "pii_rate": 0.1,
+    "requests": 5000,
+    "seed": 42,
+    "similarity_threshold": 0.86,
+    "unique_rate": 0.25,
+    "zipf_s": 1.1
+  },
+  "upstream_baseline_latency_ms": {
+    "p50": 168.151,
+    "p95": 184.747,
+    "p99": 186.719,
+    "mean": 168.679,
+    "max": 188.067,
+    "n": 500
+  },
+  "mixed_workload": {
+    "requests": 5000,
+    "duration_s": 3.3,
+    "rps": 1515.1,
+    "status_codes": {
+      "200": 4888,
+      "400": 112
+    },
+    "transport_errors": 0,
+    "client_latency_ms": {
+      "all": {
+        "p50": 1.712,
+        "p95": 184.481,
+        "p99": 194.714,
+        "mean": 65.457,
+        "max": 214.023,
+        "n": 4888
+      },
+      "cache_hit": {
+        "p50": 0.559,
+        "p95": 3.09,
+        "p99": 3.933,
+        "mean": 1.036,
+        "max": 5.025,
+        "n": 3023
+      },
+      "cache_miss": {
+        "p50": 170.641,
+        "p95": 187.63,
+        "p99": 205.768,
+        "mean": 169.878,
+        "max": 214.023,
+        "n": 1865
+      }
+    },
+    "gateway_overhead_ms": {
+      "all": {
+        "p50": 0.979,
+        "p95": 3.294,
+        "p99": 23.018,
+        "mean": 1.498,
+        "max": 28.953,
+        "n": 4888
+      },
+      "cache_hit": {
+        "p50": 0.251,
+        "p95": 2.835,
+        "p99": 3.637,
+        "mean": 0.8,
+        "max": 4.541,
+        "n": 3023
+      },
+      "cache_miss": {
+        "p50": 1.325,
+        "p95": 16.443,
+        "p99": 25.848,
+        "mean": 2.629,
+        "max": 28.953,
+        "n": 1865
+      }
+    },
+    "upstream_latency_ms": {
+      "p50": 168.021,
+      "p95": 184.236,
+      "p99": 185.781,
+      "mean": 166.847,
+      "max": 188.974,
+      "n": 1865
+    },
+    "cache_lookup_ms": {
+      "cache_hit": {
+        "p50": 0,
+        "p95": 2.63,
+        "p99": 3.453,
+        "mean": 0.622,
+        "max": 4.247,
+        "n": 3023
+      },
+      "cache_miss": {
+        "p50": 1.127,
+        "p95": 4.583,
+        "p99": 13.485,
+        "mean": 1.827,
+        "max": 26.152,
+        "n": 1865
+      }
+    },
+    "cache": {
+      "lookups": 4888,
+      "hit_ratio_pct": 61.85,
+      "exact_hit_ratio_pct": 35.74,
+      "semantic_hit_ratio_pct": 26.1,
+      "repeated_intent_hit_ratio_pct": 82.73,
+      "semantic_precision_pct": 98.75,
+      "semantic_hits_verified": 1276,
+      "avg_semantic_similarity": 0.974,
+      "coalesced_requests": 75,
+      "latency_reduction_p50_pct": 99.67,
+      "mean_latency_reduction_vs_uncached_pct": 61.47,
+      "tokens_saved": 224378,
+      "est_cost_saved_usd": 1.6492,
+      "upstream_calls_avoided": 3098,
+      "pgvector_rows_written": 1872
+    },
+    "failover": {
+      "injected_upstream_faults": 162,
+      "upstream_calls": 1984,
+      "failover_responses": 172,
+      "unrecovered_5xx": 0,
+      "failover_success_rate_pct": 100
+    },
+    "guardrails": {
+      "pii_prompts": 561,
+      "pii_redacted": 561,
+      "injection_attempts": 112,
+      "injection_blocked": 112,
+      "false_positive_blocks": 0
+    }
+  },
+  "hot_cache_throughput": {
+    "requests": 20000,
+    "duration_s": 0.668,
+    "rps": 29921.6,
+    "hit_ratio_pct": 100,
+    "client_latency_ms": {
+      "p50": 3.206,
+      "p95": 4.442,
+      "p99": 5.987,
+      "mean": 3.322,
+      "max": 15.117,
+      "n": 20000
+    },
+    "gateway_overhead_ms": {
+      "p50": 1.413,
+      "p95": 2.19,
+      "p99": 2.576,
+      "mean": 1.464,
+      "max": 11.4,
+      "n": 20000
+    }
+  },
+  "provider_health_after_workload": [
+    {
+      "name": "openai",
+      "type": "openai",
+      "state": "CLOSED",
+      "requests": 1822,
+      "failures": 162,
+      "rejected": 0,
+      "error_rate": 0.09,
+      "latency_ewma_ms": 177.28,
+      "latency_p50_ms": 168.25,
+      "latency_p95_ms": 184.88,
+      "last_error": "openai: upstream status 503: {\"error\":{\"type\":\"mock_injected_fault\",\"message\":\"mockllm injected HTTP 503\"}}",
+      "last_error_ago_s": 0.18
+    },
+    {
+      "name": "anthropic",
+      "type": "anthropic",
+      "state": "CLOSED",
+      "requests": 162,
+      "failures": 0,
+      "rejected": 0,
+      "error_rate": 0,
+      "latency_ewma_ms": 167.34,
+      "latency_p50_ms": 168.84,
+      "latency_p95_ms": 184.53
+    },
+    {
+      "name": "gemini",
+      "type": "gemini",
+      "state": "CLOSED",
+      "requests": 0,
+      "failures": 0,
+      "rejected": 0,
+      "error_rate": 0,
+      "latency_ewma_ms": 0,
+      "latency_p50_ms": 0,
+      "latency_p95_ms": 0
+    }
+  ],
+  "guardrail_microbench_us": {
+    "prompt_bytes_3_6k": {
+      "p50": 85.417,
+      "p95": 101.209,
+      "p99": 121.417,
+      "mean": 88.908,
+      "max": 896.625,
+      "n": 2000
+    },
+    "typical_prompt": {
+      "p50": 2.917,
+      "p95": 8.541,
+      "p99": 10.583,
+      "mean": 3.885,
+      "max": 33.667,
+      "n": 20000
+    }
+  },
+  "embedder_microbench_us": {
+    "corpus_max_cross_intent_similarity": 0.8198,
+    "corpus_min_paraphrase_similarity": 0.6341,
+    "embed_latency": {
+      "p50": 2,
+      "p95": 2.625,
+      "p99": 4.917,
+      "mean": 2.144,
+      "max": 275.375,
+      "n": 20000
+    }
+  }
+}

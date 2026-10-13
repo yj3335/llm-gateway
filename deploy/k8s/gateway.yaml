@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+  labels: { app.kubernetes.io/name: llm-gateway }
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: llm-gateway }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: llm-gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: llm-gateway }
+      containers:
+        - name: gateway
+          image: ghcr.io/yj3335/llm-gateway:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/llm-gateway/gateway.yaml"]
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - secretRef: { name: llm-gateway-secrets }
+          env:
+            - name: GOMEMLIMIT
+              valueFrom: { resourceFieldRef: { resource: limits.memory } }
+            - name: GOMAXPROCS
+              valueFrom: { resourceFieldRef: { resource: limits.cpu } }
+          resources:
+            requests: { cpu: 500m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/llm-gateway, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: llm-gateway-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+  labels: { app.kubernetes.io/name: llm-gateway }
+spec:
+  selector: { app.kubernetes.io/name: llm-gateway }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-gateway
+  namespace: llm-gateway
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: llm-gateway }
