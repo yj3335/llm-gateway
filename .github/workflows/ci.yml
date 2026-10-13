@@ -48,6 +48,8 @@ jobs:
         run: go vet ./...
       - name: go test (race detector)
         run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: guardrail <1ms latency budget (no race instrumentation)
+        run: go test -count=1 -run TestLatencyBudget -v ./internal/guardrails
       - name: guardrail latency benchmarks
         run: go test -run '^$' -bench . -benchtime 2000x ./internal/guardrails ./internal/cache
       - name: benchmark smoke (cmd/bench)

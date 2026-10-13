@@ -216,12 +216,14 @@ func TestLatencyBudget(t *testing.T) {
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 	p50, p99 := samples[n/2], samples[n*99/100]
 	t.Logf("guardrail InspectInput on %d-byte prompt: p50=%v p99=%v", len(prompt), p50, p99)
-	budget := time.Millisecond
 	if raceEnabled {
-		budget *= 20
+		// Race instrumentation slows execution 5-20x and varies with the host;
+		// the budget is enforced by the non-race run (see CI).
+		t.Logf("race detector enabled: latency budget not enforced")
+		return
 	}
-	if p99 > budget {
-		t.Fatalf("p99 %v exceeds %v budget", p99, budget)
+	if p99 > time.Millisecond {
+		t.Fatalf("p99 %v exceeds 1ms budget", p99)
 	}
 }
 

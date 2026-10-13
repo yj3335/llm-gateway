@@ -150,6 +150,7 @@ func TestConcurrentAdmissionIsExact(t *testing.T) {
 	id := tenant(t)
 	var allowed atomic.Int64
 	var wg sync.WaitGroup
+	start := time.Now()
 	for i := 0; i < 300; i++ {
 		wg.Add(1)
 		go func() {
@@ -160,9 +161,13 @@ func TestConcurrentAdmissionIsExact(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	// Refill during the test window is < 1 token at 50 RPM.
-	if got := allowed.Load(); got != 50 {
-		t.Fatalf("expected exactly 50 admissions under contention, got %d", got)
+	// The bucket holds 50 tokens; at most floor(elapsed * 50/60s) more can
+	// refill while the goroutines run (0 on a fast machine, maybe 1-2 on a
+	// slow CI runner). Anything outside that window means a lost or
+	// double-spent token.
+	refill := int64(time.Since(start).Seconds() * 50 / 60)
+	if got := allowed.Load(); got < 50 || got > 50+refill {
+		t.Fatalf("expected 50..%d admissions under contention, got %d", 50+refill, got)
 	}
 }
 

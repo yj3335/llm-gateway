@@ -3,5 +3,5 @@
 package guardrails
 
 // The race detector instruments every memory access (5-20x slowdown), so the
-// latency budget is scaled when running under -race.
+// latency budget test only logs under -race; CI enforces it in a non-race run.
 const raceEnabled = true
