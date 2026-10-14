@@ -57,19 +57,27 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 			MinIdleConns: 16,
 		})
 		closers = append(closers, func() { _ = rdb.Close() })
-		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		if err := rdb.Ping(pctx).Err(); err != nil {
+		err := waitFor(ctx, cfg.Server.DependencyWait, log, "redis", func(ctx context.Context) error {
+			pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			return rdb.Ping(pctx).Err()
+		})
+		if err != nil {
 			log.Warn("redis unreachable: rate limiter will use local fallback until it recovers; exact cache is memory-only", "addr", cfg.Redis.Addr, "err", err)
 		} else {
 			redisUp = true
 		}
-		cancel()
 	}
 
 	// ---- PostgreSQL -----------------------------------------------------------
 	var pool *pgxpool.Pool
 	if !o.SkipPG && cfg.Postgres.DSN != "" {
-		p, err := storage.Connect(ctx, storage.Options{DSN: cfg.Postgres.DSN, MaxConns: cfg.Postgres.MaxConns, MinConns: cfg.Postgres.MinConns, Migrate: cfg.Postgres.RunMigrations, HNSWEfSearch: cfg.Postgres.HNSWEfSearch})
+		var p *pgxpool.Pool
+		err := waitFor(ctx, cfg.Server.DependencyWait, log, "postgres", func(ctx context.Context) error {
+			var cerr error
+			p, cerr = storage.Connect(ctx, storage.Options{DSN: cfg.Postgres.DSN, MaxConns: cfg.Postgres.MaxConns, MinConns: cfg.Postgres.MinConns, Migrate: cfg.Postgres.RunMigrations, HNSWEfSearch: cfg.Postgres.HNSWEfSearch})
+			return cerr
+		})
 		if err != nil {
 			log.Warn("postgres unreachable: semantic cache and API keys fall back to memory", "err", err)
 		} else {
@@ -274,4 +282,24 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 	}
 	log.Info("gateway assembled", "backends", backends, "providers", len(providers), "routes", len(routes))
 	return g, cleanup, nil
+}
+
+// waitFor retries fn every second until it succeeds or wait elapses, so the
+// gateway tolerates dependencies that start after it (Kubernetes, Compose).
+func waitFor(ctx context.Context, wait time.Duration, log *slog.Logger, name string, fn func(context.Context) error) error {
+	deadline := time.Now().Add(wait)
+	for attempt := 1; ; attempt++ {
+		err := fn(ctx)
+		if err == nil || time.Now().After(deadline) || ctx.Err() != nil {
+			return err
+		}
+		if attempt == 1 {
+			log.Info("waiting for dependency", "dependency", name, "max_wait", wait.String(), "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }

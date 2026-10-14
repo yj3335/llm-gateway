@@ -12,7 +12,7 @@ spec:
     metadata:
       labels: { app.kubernetes.io/name: llm-gateway-web }
     spec:
-      securityContext: { runAsNonRoot: true }
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }   # node user, numeric
       containers:
         - name: web
           image: ghcr.io/yj3335/llm-gateway-web:latest

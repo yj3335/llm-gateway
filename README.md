@@ -96,6 +96,7 @@ flowchart LR
 - **Pre-warmed connection pool.** Profiling showed the miss path's p95 tail (~47 ms) came from the pool opening connections lazily, with type registration, during bursts. A warmed `min_conns` pool cut the miss-lookup p95 from 47 ms to 4.6 ms. Semantic hit counters are batched into one `UPDATE … FROM unnest()` every 2 s to avoid hot-row lock contention.
 - **Deterministic local embedder behind an `Embedder` interface.** It uses signed feature hashing of stemmed, synonym-canonicalized unigrams, bigrams, and character trigrams into 384 dimensions (2 µs per prompt), so benchmarks need no external API. It captures *lexical* paraphrases such as reordering, contractions, filler words, and common synonyms, not deep semantics. For production, set `cache.embedder: openai` (an OpenAI-compatible `/v1/embeddings` endpoint called with `dimensions=384`); the pgvector schema stays the same. Precision is **measured** rather than assumed: the mock echoes the prompt it answered, so the benchmark verifies every semantic hit against ground truth.
 - **Fail open on infrastructure, fail closed on policy.** If Redis or Postgres is down, the gateway degrades to local rate limiting and an in-memory cache and key store rather than going offline. Guardrails never fail open.
+- **Found by deploying to a real cluster.** The images declared their user by name (`USER nonroot`), which Kubernetes can't verify against `runAsNonRoot: true`, so every gateway and web pod was refused at start. Docker Compose doesn't enforce this, so compose tests had passed. Both images now use numeric UIDs (65532, 1000), and the pod specs pin them too. The cluster test also motivated `server.dependency_wait`: pods start in any order, so the gateway retries Postgres and Redis at startup (default 30s) instead of silently running on in-memory fallbacks.
 - **Overhead is measured, not estimated.** The gateway reports total time minus upstream time per request. Coalesced followers subtract their actual wait.
 
 ---
@@ -216,11 +217,12 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 
 | Suite | Count | What it covers |
 |---|---:|---|
-| Go unit + integration (`go test -race ./...`) | **105 passed, 0 failed, 0 skipped, 0 data races** | JWT HS256/RS256/JWKS and `alg` confusion; layered key store; Lua dual bucket against **real Redis** (exact admission under 300 concurrent goroutines, TPM atomicity, refill, fallback and recovery); PII and injection tables with false-positive cases, a streaming redactor at multiple chunk sizes, and a **p99 latency budget test**; embedder separability; **live pgvector HNSW** search; breaker state machine (stale tickets, fast-failure reordering); every provider wire format over HTTP; 5xx/timeout/open-circuit failover; full-pipeline gateway tests (cache tiers, coalescing, 429s, PII, output redaction, SSE, CORS, telemetry); config and Kubernetes ConfigMap validation |
+| Go unit + integration (`go test -race ./...`) | **106 passed, 0 failed, 0 skipped, 0 data races** | JWT HS256/RS256/JWKS and `alg` confusion; layered key store; Lua dual bucket against **real Redis** (exact admission under 300 concurrent goroutines, TPM atomicity, refill, fallback and recovery); PII and injection tables with false-positive cases, a streaming redactor at multiple chunk sizes, and a **p99 latency budget test**; embedder separability; **live pgvector HNSW** search; breaker state machine (stale tickets, fast-failure reordering); every provider wire format over HTTP; 5xx/timeout/open-circuit failover; full-pipeline gateway tests (cache tiers, coalescing, 429s, PII, output redaction, SSE, CORS, telemetry); startup dependency retry; config and Kubernetes ConfigMap validation |
 | Jest (`web/__tests__`) | **27 passed** | formatting utilities, playground request planning, SSE parsing, KPI / provider-matrix / audit-table / playground components |
 | Playwright (`web/e2e/dashboard.spec.ts`) | **4 passed** (+1 live) | dashboard rendering, SSE→polling fallback, playground toggles (semantic cache, PII, failover, injection), offline banner. The `E2E_LIVE=1` spec drives the real gateway (miss → semantic hit, redaction, failover) and passed against the running stack. |
 | `npm run build` | ✓ | zero TypeScript or build errors |
 | Docker Compose end-to-end (`scripts/compose-smoke.sh`) | **22 passed** | Full containerized stack (gateway, MockLLM, pgvector, Redis, Prometheus, web UI): auth/401, MISS → HIT-EXACT → HIT-SEMANTIC from containerized pgvector, PII REDACT and BLOCK, injection block, chaos failover, SSE translation, 429 + `Retry-After`, rows in `semantic_cache` / `guardrail_audit`, HNSW index, `/metrics`, telemetry SSE, Prometheus scraping (`up=1`), dashboard + CORS. The live Playwright spec also passes against the dashboard container. Runs in CI on every push. |
+| Kubernetes end-to-end (`scripts/k8s-smoke.sh`) | **19 passed** | The production manifests plus a local overlay on a real cluster (k3s locally, kind in CI) with ingress-nginx and metrics-server: 3/3 replicas ready as non-root UID 65532 with a read-only root FS; all 19 functional checks routed through the **Ingress** and load-balanced across all 3 replicas (shared Redis/pgvector cache); metrics aggregated across pods; HPA reading live CPU; PDB allowing exactly 1 disruption; **a pod deleted under load → 291 requests, 0 failures**; **rolling restart of all replicas → 590 requests, 0 failures**; Redis outage → requests keep succeeding on the local fallback, then return to Redis automatically. Runs in CI on every push. |
 
 ---
 
@@ -236,7 +238,19 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 
 ## Deployment
 
-`deploy/k8s/` contains a Kustomization with a Namespace, ConfigMap, a Secret example, the gateway Deployment (3 replicas, zone spread, non-root, read-only root FS, `GOMEMLIMIT`/`GOMAXPROCS` from limits, readiness via `/readyz`), Service, PodDisruptionBudget, **HPA** (CPU-based, with a commented `llmgateway_active_connections` custom metric), **Ingress** (proxy buffering off for SSE), Redis, and the web UI. CI (`.github/workflows/ci.yml`) runs gofmt, vet, race tests against pgvector and Redis service containers, the 1 ms guardrail latency budget, a benchmark smoke run, typecheck, Jest, the Next.js build, Playwright, Docker image builds, and a full `docker compose up` with the end-to-end smoke test.
+`deploy/k8s/base/` contains the production Kustomization: a Namespace, ConfigMap, a Secret example, the gateway Deployment (3 replicas, zone spread, non-root, read-only root FS, `GOMEMLIMIT`/`GOMAXPROCS` from limits, readiness via `/readyz`), Service, PodDisruptionBudget, **HPA** (CPU-based, with a commented `llmgateway_active_connections` custom metric), **Ingress** (ingress-nginx, proxy buffering off for SSE), Redis, and the web UI.
+
+`deploy/k8s/overlays/local/` runs those exact manifests on a single-node cluster. It adds Postgres (pgvector) and MockLLM, uses locally built images, and supplies dev secrets:
+
+```bash
+colima start --kubernetes --cpu 4 --memory 6     # or kind / Docker Desktop Kubernetes
+docker compose build                             # images are shared with the cluster's runtime
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/baremetal/deploy.yaml
+kubectl apply -k deploy/k8s/overlays/local
+scripts/k8s-smoke.sh                             # 19 checks incl. self-healing and zero-downtime rollout
+```
+
+CI (`.github/workflows/ci.yml`) runs gofmt, vet, race tests against pgvector and Redis service containers, the 1 ms guardrail latency budget, a benchmark smoke run, typecheck, Jest, the Next.js build, Playwright, Docker image builds, a full `docker compose up` with the end-to-end smoke test, and a **kind** cluster deployment running `scripts/k8s-smoke.sh`.
 
 ## Repository layout
 
@@ -252,7 +266,8 @@ internal/gateway                request pipeline + dependency wiring
 internal/{config,storage,mockllm}
 migrations/001_init_pgvector.sql pgvector schema, HNSW index, tenants, API keys, guardrail audit
 web/                            Next.js 16 + React 19 + Tailwind 4 control plane, Jest + Playwright
-deploy/{k8s,prometheus}         Kubernetes manifests, Prometheus scrape config
+deploy/k8s/{base,overlays/local} Kubernetes manifests (production base + local-cluster overlay)
+deploy/prometheus/              Prometheus scrape config
 benchmarks/                     k6 script + results.json (generated by cmd/bench)
 scripts/                        .venv toolchain bootstrap, local Postgres/Redis lifecycle
 ```
@@ -262,4 +277,5 @@ scripts/                        .venv toolchain bootstrap, local Postgres/Redis 
 - The benchmark runs on a single machine against a mock upstream. Absolute RPS is bounded by the mock's ~168 ms latency × 100 workers on misses, and by shared CPU on hits. Treat the numbers as relative, not production capacity.
 - The hashing embedder measures lexical similarity. Deep paraphrases need the pluggable HTTP embedder.
 - pgvector 0.6's HNSW applies `WHERE` filters after the index scan. For very large multi-tenant tables, use partial indexes per large tenant, or pgvector ≥ 0.8 iterative scans.
-- The Kubernetes manifests are validated statically (YAML parsing plus a test that loads the ConfigMap through the gateway's config loader) but haven't been applied to a live cluster. The Docker images and the full compose stack are built and tested end to end.
+- Kubernetes is verified on single-node clusters (k3s and kind), not on a managed multi-node cloud cluster. Zone spreading and autoscaling *under real load* therefore aren't exercised; the HPA reading metrics and the PDB budget are.
+- Dashboard telemetry (`/v1/telemetry/*`) is per replica: behind a load balancer, each dashboard connection shows the replica it reached. Prometheus, which scrapes every pod, is the source of fleet-wide totals.

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -456,5 +457,24 @@ func TestCORSAndTokenEndpoint(t *testing.T) {
 	r := h.post(bearer(tr.AccessToken), chatBody("gpt-4o-mini", "hi", false))
 	if r.status != 200 || r.header.Get("X-RateLimit-Limit-Requests") != "42" {
 		t.Fatalf("minted token: %d %v", r.status, r.header)
+	}
+}
+
+func TestWaitForRetriesUntilDependencyIsUp(t *testing.T) {
+	calls := 0
+	err := waitFor(context.Background(), 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)), "dep", func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("not yet")
+		}
+		return nil
+	})
+	if err != nil || calls != 3 {
+		t.Fatalf("expected success on 3rd attempt, got err=%v calls=%d", err, calls)
+	}
+	calls = 0
+	err = waitFor(context.Background(), 0, slog.New(slog.NewTextHandler(io.Discard, nil)), "dep", func(context.Context) error { calls++; return fmt.Errorf("down") })
+	if err == nil || calls != 1 {
+		t.Fatalf("zero wait must try once and fail: err=%v calls=%d", err, calls)
 	}
 }

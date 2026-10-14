@@ -7,6 +7,7 @@ server:
   max_body_bytes: 1048576
   cors_origins: ["http://localhost:3000", "http://127.0.0.1:3000"]
   enable_chaos_headers: true        # playground/bench fault injection; disable in production
+  dependency_wait: 30s              # retry Redis/Postgres at startup before falling back to memory
 
 auth:
   jwt_hmac_secret: "dev-insecure-change-me"

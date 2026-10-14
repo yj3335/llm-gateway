@@ -1,0 +1,60 @@
+# Gateway config for the local cluster: same as production except providers
+# point at MockLLM and the dev token endpoint / chaos headers are enabled.
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 120s
+  cors_origins: ["http://localhost:13000", "http://127.0.0.1:13000"]
+  enable_chaos_headers: true
+  dependency_wait: 60s
+auth:
+  issuer: "llm-gateway"
+  audience: "llm-gateway"
+  dev_token_endpoint: true
+  api_key_cache_ttl: 60s
+  default_rpm: 600
+  default_tpm: 200000
+  default_pii_mode: REDACT
+redis:
+  addr: "redis:6379"
+  pool_size: 128
+  dial_timeout: 500ms
+  op_timeout: 250ms
+postgres:
+  max_conns: 16
+  min_conns: 4
+  run_migrations: true
+  hnsw_ef_search: 40
+ratelimit: { enabled: true, default_max_tokens: 256 }
+guardrails: { enabled: true, injection_threshold: 0.7, scan_output: true }
+cache:
+  enabled: true
+  similarity_threshold: 0.86
+  ttl: 24h
+  l1_max_entries: 50000
+  embedder: hashing
+  write_queue_size: 8192
+  write_workers: 4
+providers:
+  - { name: openai,    type: openai,    base_url: "http://mockllm:8090", timeout: 30s, default_model: gpt-4o-mini }
+  - { name: anthropic, type: anthropic, base_url: "http://mockllm:8090", timeout: 30s, default_model: claude-3-5-haiku-latest }
+  - { name: gemini,    type: gemini,    base_url: "http://mockllm:8090", timeout: 30s, default_model: gemini-2.0-flash }
+  - { name: ollama,    type: ollama,    base_url: "http://mockllm:8090", timeout: 60s, default_model: llama3.1 }
+routes:
+  - { match: "gpt-*",    targets: [{ provider: openai }, { provider: anthropic, model: claude-3-5-haiku-latest }] }
+  - { match: "claude-*", targets: [{ provider: anthropic }, { provider: openai, model: gpt-4o-mini }] }
+  - { match: "gemini-*", targets: [{ provider: gemini }, { provider: openai, model: gpt-4o-mini }] }
+  - { match: "llama*",   targets: [{ provider: ollama }, { provider: openai, model: gpt-4o-mini }] }
+circuit_breaker:
+  failure_rate_window: 20
+  min_requests: 10
+  failure_rate: 0.5
+  open_timeout: 5s
+  half_open_max_requests: 2
+  half_open_successes: 2
+telemetry: { stream_interval: 1s, sample_window: 10000 }
+pricing:
+  default: { input: 0.0025, output: 0.01 }
+tenants:
+  - { tenant_id: demo, tier: enterprise, rpm_limit: 6000, tpm_limit: 2000000, pii_mode: REDACT, api_keys: ["gw-demo-key-redact"] }
+  - { tenant_id: strict-health, tier: regulated, rpm_limit: 600, tpm_limit: 200000, pii_mode: BLOCK, api_keys: ["gw-demo-key-block"] }

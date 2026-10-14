@@ -39,6 +39,9 @@ type ServerConfig struct {
 	// EnableChaosHeaders lets clients request fault injection via
 	// X-Gateway-Chaos (used by the playground & benchmarks). Off in prod.
 	EnableChaosHeaders bool `yaml:"enable_chaos_headers"`
+	// DependencyWait is how long startup retries Redis and PostgreSQL before
+	// falling back to in-memory mode (containers may start in any order).
+	DependencyWait time.Duration `yaml:"dependency_wait"`
 }
 
 type AuthConfig struct {
@@ -160,6 +163,7 @@ func Default() Config {
 			ReadTimeout:     30 * time.Second,
 			WriteTimeout:    120 * time.Second,
 			ShutdownTimeout: 10 * time.Second,
+			DependencyWait:  30 * time.Second,
 			MaxBodyBytes:    1 << 20,
 			CORSOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000"},
 		},

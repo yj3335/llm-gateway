@@ -13,11 +13,11 @@ COPY --from=build /out/gateway /gateway
 COPY configs/gateway.yaml /etc/llm-gateway/gateway.yaml
 ENV LLMGW_CONFIG=/etc/llm-gateway/gateway.yaml
 EXPOSE 8080
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/gateway"]
 
 FROM gcr.io/distroless/static-debian12:nonroot AS mockllm
 COPY --from=build /out/mockllm /mockllm
 EXPOSE 8090
-USER nonroot:nonroot
+USER 65532:65532
 ENTRYPOINT ["/mockllm"]

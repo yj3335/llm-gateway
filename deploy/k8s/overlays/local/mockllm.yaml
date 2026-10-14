@@ -1,0 +1,31 @@
+# Local-only mock upstream used in place of real provider APIs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockllm
+  labels: { app: mockllm }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mockllm } }
+  template:
+    metadata: { labels: { app: mockllm } }
+    spec:
+      containers:
+        - name: mockllm
+          image: llm-gateway-mockllm:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-addr", ":8090", "-ttft", "120ms", "-tpot", "1ms"]
+          ports: [{ containerPort: 8090 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8090 }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mockllm
+spec:
+  selector: { app: mockllm }
+  ports: [{ port: 8090, targetPort: 8090 }]

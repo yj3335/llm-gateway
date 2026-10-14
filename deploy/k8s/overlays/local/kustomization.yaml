@@ -1,0 +1,46 @@
+# Local overlay: runs the production manifests on a single-node dev cluster
+# (k3s via `colima start --kubernetes`, kind, or Docker Desktop).
+#   docker compose build            # images are shared with the cluster's Docker runtime
+#   kubectl apply -k deploy/k8s/overlays/local
+#   scripts/k8s-smoke.sh
+# Adds Postgres (pgvector) and MockLLM, swaps ghcr.io images for locally
+# built ones, supplies dev secrets, and points providers at the mock.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: llm-gateway
+resources:
+  - ../../base
+  - postgres.yaml
+  - mockllm.yaml
+images:
+  - name: ghcr.io/yj3335/llm-gateway
+    newName: llm-gateway-gateway
+    newTag: latest
+  - name: ghcr.io/yj3335/llm-gateway-web
+    newName: llm-gateway-web
+    newTag: latest
+configMapGenerator:
+  - name: llm-gateway-config
+    namespace: llm-gateway
+    behavior: replace
+    files: [gateway.yaml]
+secretGenerator:
+  - name: llm-gateway-secrets
+    namespace: llm-gateway
+    literals:
+      - LLMGW_JWT_SECRET=local-dev-secret
+      - LLMGW_POSTGRES_DSN=postgres://llmgw:llmgw@postgres:5432/llmgateway?sslmode=disable
+patches:
+  # :latest images default to imagePullPolicy Always; use the local image.
+  - target: { kind: Deployment, name: llm-gateway-web }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+  # No cert-manager locally: serve plain HTTP through ingress-nginx.
+  - target: { kind: Ingress, name: llm-gateway }
+    patch: |-
+      - op: remove
+        path: /spec/tls
+      - op: remove
+        path: /metadata/annotations/cert-manager.io~1cluster-issuer

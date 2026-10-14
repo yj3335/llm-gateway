@@ -7,7 +7,7 @@ PG_DSN ?= postgres://llmgw@localhost:5432/llmgateway?sslmode=disable
 REDIS_ADDR ?= localhost:6379
 TEST_ENV := LLMGW_TEST_REDIS_ADDR=$(REDIS_ADDR) LLMGW_TEST_POSTGRES_DSN="$(PG_DSN)"
 
-.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-quick k6 run up down web-dev fmt vet clean
+.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-quick k6 run up down compose-test k8s-deploy k8s-test web-dev fmt vet clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -69,6 +69,16 @@ up: ## docker compose up --build (full stack incl. Prometheus + UI)
 
 down: ## docker compose down -v
 	docker compose down -v
+
+compose-test: ## End-to-end smoke test of the running compose stack
+	scripts/compose-smoke.sh
+
+k8s-deploy: ## Build images and deploy to the current kube context (local overlay)
+	docker compose build gateway mockllm web
+	$(VENV) kubectl apply -k deploy/k8s/overlays/local
+
+k8s-test: ## Kubernetes end-to-end test (self-healing, zero-downtime rollout, HPA, PDB)
+	$(VENV) scripts/k8s-smoke.sh
 
 clean: ## Remove build outputs and local service data
 	rm -rf bin web/.next web/test-results web/playwright-report .data

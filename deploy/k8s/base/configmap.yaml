@@ -11,6 +11,7 @@ data:
       write_timeout: 120s
       cors_origins: ["https://gateway-ui.example.com"]
       enable_chaos_headers: false
+      dependency_wait: 60s
     auth:
       issuer: "llm-gateway"
       audience: "llm-gateway"

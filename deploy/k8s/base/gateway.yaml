@@ -23,6 +23,8 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532   # distroless "nonroot"; numeric so the kubelet can verify it
+        runAsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
       topologySpreadConstraints:
         - maxSkew: 1

@@ -52,7 +52,7 @@ func TestValidate(t *testing.T) {
 
 // The Kubernetes ConfigMap embeds a full gateway config; it must stay valid.
 func TestK8sConfigMapIsValid(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "k8s", "configmap.yaml"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "k8s", "base", "configmap.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
