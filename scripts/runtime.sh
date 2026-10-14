@@ -47,11 +47,12 @@ up() {
   [ "${1:-}" = "--k8s" ] && k8s=1
   install_pkgs
   if [ "$k8s" = 1 ]; then
-    echo "==> starting Colima with Kubernetes (4 CPU / 6 GB / 20 GB disk)"
-    colima start --cpu 4 --memory 6 --disk 20 --vm-type vz --kubernetes
+    # Colima checks for kubectl on PATH before starting k3s; it lives in .venv.
     # shellcheck disable=SC1091
     source "$ROOT/.venv/bin/activate"
     command -v kubectl >/dev/null || { echo "kubectl missing: run scripts/bootstrap-venv.sh" >&2; exit 1; }
+    echo "==> starting Colima with Kubernetes (4 CPU / 6 GB / 20 GB disk)"
+    colima start --cpu 4 --memory 6 --disk 20 --vm-type vz --kubernetes
     kubectl wait --for=condition=Ready node --all --timeout=180s
     echo "==> installing ingress-nginx $INGRESS_NGINX_VERSION"
     kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/$INGRESS_NGINX_VERSION/deploy/static/provider/baremetal/deploy.yaml" >/dev/null
