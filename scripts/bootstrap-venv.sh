@@ -5,6 +5,7 @@
 #   - PostgreSQL 16 + pgvector (prebuilt binaries from the pgserver wheel) -> .venv/opt/pgserver
 #   - Redis 7.4 built from source -> .venv/opt/redis
 #   - k6 load-testing binary -> .venv/bin/k6
+#   - kubectl                -> .venv/bin/kubectl
 #   - npm cache + Playwright browsers are redirected into .venv
 # Usage: scripts/bootstrap-venv.sh   then   source .venv/bin/activate
 set -euo pipefail
@@ -13,6 +14,7 @@ VENV="$ROOT/.venv"
 GO_VERSION="${GO_VERSION:-go1.27.2}"
 REDIS_VERSION="${REDIS_VERSION:-7.4.2}"
 K6_VERSION="${K6_VERSION:-v2.3.0}"
+KUBECTL_VERSION="${KUBECTL_VERSION:-v1.37.1}"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # darwin | linux
 ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && ARCH=amd64; [ "$ARCH" = "aarch64" ] && ARCH=arm64
 
@@ -53,6 +55,12 @@ if [ ! -x "$VENV/bin/k6" ]; then
     cp "$TMP"/k6-*/k6 "$VENV/bin/k6"
   fi
   rm -rf "$TMP"
+fi
+
+if [ ! -x "$VENV/bin/kubectl" ]; then
+  echo "==> kubectl $KUBECTL_VERSION"
+  curl -sSL -o "$VENV/bin/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/$OS/$ARCH/kubectl"
+  chmod +x "$VENV/bin/kubectl"
 fi
 
 if ! grep -q "llm-gateway self-contained toolchain" "$VENV/bin/activate"; then

@@ -160,6 +160,8 @@ Under that load the whole compose stack used about 220 MB of RAM (gateway 32 MB,
 
 ### Option A: Docker (full stack)
 
+No Docker on your Mac? `make runtime-up` installs and starts Colima plus the Docker CLI on demand, and `make runtime-down` removes the VM, images, packages and config again. Use `make runtime-up-k8s` to add Kubernetes (k3s) and ingress-nginx.
+
 ```bash
 docker compose up --build
 # Dashboard   http://localhost:3000
@@ -243,11 +245,10 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 `deploy/k8s/overlays/local/` runs those exact manifests on a single-node cluster. It adds Postgres (pgvector) and MockLLM, uses locally built images, and supplies dev secrets:
 
 ```bash
-colima start --kubernetes --cpu 4 --memory 6     # or kind / Docker Desktop Kubernetes
-docker compose build                             # images are shared with the cluster's runtime
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/baremetal/deploy.yaml
-kubectl apply -k deploy/k8s/overlays/local
-scripts/k8s-smoke.sh                             # 19 checks incl. self-healing and zero-downtime rollout
+make runtime-up-k8s    # macOS: Colima + k3s + ingress-nginx (or use kind / Docker Desktop + ingress-nginx)
+make k8s-deploy        # build images (shared with the cluster runtime) + kubectl apply -k deploy/k8s/overlays/local
+make k8s-test          # 19 checks incl. self-healing and zero-downtime rollout
+make runtime-down      # remove the VM, images, packages and config
 ```
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, race tests against pgvector and Redis service containers, the 1 ms guardrail latency budget, a benchmark smoke run, typecheck, Jest, the Next.js build, Playwright, Docker image builds, a full `docker compose up` with the end-to-end smoke test, and a **kind** cluster deployment running `scripts/k8s-smoke.sh`.

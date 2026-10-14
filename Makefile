@@ -7,7 +7,7 @@ PG_DSN ?= postgres://llmgw@localhost:5432/llmgateway?sslmode=disable
 REDIS_ADDR ?= localhost:6379
 TEST_ENV := LLMGW_TEST_REDIS_ADDR=$(REDIS_ADDR) LLMGW_TEST_POSTGRES_DSN="$(PG_DSN)"
 
-.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-quick k6 run up down compose-test k8s-deploy k8s-test web-dev fmt vet clean
+.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-quick k6 run up down compose-test k8s-deploy k8s-test runtime-up runtime-up-k8s runtime-stop runtime-down runtime-status web-dev fmt vet clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -72,6 +72,21 @@ down: ## docker compose down -v
 
 compose-test: ## End-to-end smoke test of the running compose stack
 	scripts/compose-smoke.sh
+
+runtime-up: ## macOS: install + start Colima/Docker on demand (2 CPU / 4 GB VM)
+	scripts/runtime.sh up
+
+runtime-up-k8s: ## macOS: same plus Kubernetes (k3s) and ingress-nginx (4 CPU / 6 GB VM)
+	scripts/runtime.sh up --k8s
+
+runtime-stop: ## Stop the Colima VM (keeps images and packages)
+	scripts/runtime.sh stop
+
+runtime-down: ## Delete the VM, images, Colima/Docker packages, config and caches
+	scripts/runtime.sh down
+
+runtime-status: ## Show runtime packages, VM state and disk usage
+	scripts/runtime.sh status
 
 k8s-deploy: ## Build images and deploy to the current kube context (local overlay)
 	docker compose build gateway mockllm web
