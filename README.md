@@ -144,7 +144,14 @@ flowchart LR
 
 **Interpretation:** the p99 overhead on misses (~25 ms) is Postgres HNSW search competing for CPU with the load generator and 100 in-flight handlers on one laptop. Hits stay under 4 ms at p99. The embedder's offline separability check found a minimum paraphrase similarity of 0.63 and a maximum cross-intent similarity of 0.82, against a 0.86 threshold. Some paraphrases therefore *miss* the semantic tier (by design, favoring precision) and are answered upstream.
 
-**k6** (`benchmarks/k6-load-test.js`, `make k6`): a 10-second smoke run against the standalone gateway processes reached 6,863 req/s. All thresholds passed: overhead p95 0.75 ms, 100% failover success, and every injection blocked.
+**k6** (`benchmarks/k6-load-test.js`, `make k6`): 10-second runs, all thresholds passing (100% failover success, every injection blocked):
+
+| Target | Throughput | Gateway overhead p95 | Client latency p95 |
+|---|---:|---:|---:|
+| Native gateway processes (15 CPUs) | 6,863 req/s | 0.75 ms | 1.38 ms |
+| `docker compose` stack in a 2-CPU / 4 GB Linux VM | 3,310 req/s | 1.20 ms | 3.38 ms |
+
+Under that load the whole compose stack used about 220 MB of RAM (gateway 32 MB, Postgres 126 MB).
 
 ---
 
@@ -160,6 +167,12 @@ docker compose up --build
 ```
 
 Compose starts `pgvector/pgvector:pg16`, Redis 7, MockLLM, the gateway, Prometheus, and the web UI. Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`, and point the `providers[].base_url` values in `configs/gateway.yaml` at real endpoints to use live models.
+
+Verify the running stack end to end:
+
+```bash
+scripts/compose-smoke.sh   # 22 checks: auth, cache tiers, pgvector, guardrails, failover, SSE, 429s, Prometheus, UI
+```
 
 ### Option B: Self-contained `.venv` toolchain (no Docker, no system installs)
 
@@ -207,6 +220,7 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 | Jest (`web/__tests__`) | **27 passed** | formatting utilities, playground request planning, SSE parsing, KPI / provider-matrix / audit-table / playground components |
 | Playwright (`web/e2e/dashboard.spec.ts`) | **4 passed** (+1 live) | dashboard rendering, SSE→polling fallback, playground toggles (semantic cache, PII, failover, injection), offline banner. The `E2E_LIVE=1` spec drives the real gateway (miss → semantic hit, redaction, failover) and passed against the running stack. |
 | `npm run build` | ✓ | zero TypeScript or build errors |
+| Docker Compose end-to-end (`scripts/compose-smoke.sh`) | **22 passed** | Full containerized stack (gateway, MockLLM, pgvector, Redis, Prometheus, web UI): auth/401, MISS → HIT-EXACT → HIT-SEMANTIC from containerized pgvector, PII REDACT and BLOCK, injection block, chaos failover, SSE translation, 429 + `Retry-After`, rows in `semantic_cache` / `guardrail_audit`, HNSW index, `/metrics`, telemetry SSE, Prometheus scraping (`up=1`), dashboard + CORS. The live Playwright spec also passes against the dashboard container. Runs in CI on every push. |
 
 ---
 
@@ -222,7 +236,7 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 
 ## Deployment
 
-`deploy/k8s/` contains a Kustomization with a Namespace, ConfigMap, a Secret example, the gateway Deployment (3 replicas, zone spread, non-root, read-only root FS, `GOMEMLIMIT`/`GOMAXPROCS` from limits, readiness via `/readyz`), Service, PodDisruptionBudget, **HPA** (CPU-based, with a commented `llmgateway_active_connections` custom metric), **Ingress** (proxy buffering off for SSE), Redis, and the web UI. CI (`.github/workflows/ci.yml`) runs gofmt, vet, race tests against pgvector and Redis service containers, a benchmark smoke run, typecheck, Jest, the Next.js build, Playwright, and Docker image builds.
+`deploy/k8s/` contains a Kustomization with a Namespace, ConfigMap, a Secret example, the gateway Deployment (3 replicas, zone spread, non-root, read-only root FS, `GOMEMLIMIT`/`GOMAXPROCS` from limits, readiness via `/readyz`), Service, PodDisruptionBudget, **HPA** (CPU-based, with a commented `llmgateway_active_connections` custom metric), **Ingress** (proxy buffering off for SSE), Redis, and the web UI. CI (`.github/workflows/ci.yml`) runs gofmt, vet, race tests against pgvector and Redis service containers, the 1 ms guardrail latency budget, a benchmark smoke run, typecheck, Jest, the Next.js build, Playwright, Docker image builds, and a full `docker compose up` with the end-to-end smoke test.
 
 ## Repository layout
 
@@ -248,4 +262,4 @@ scripts/                        .venv toolchain bootstrap, local Postgres/Redis 
 - The benchmark runs on a single machine against a mock upstream. Absolute RPS is bounded by the mock's ~168 ms latency × 100 workers on misses, and by shared CPU on hits. Treat the numbers as relative, not production capacity.
 - The hashing embedder measures lexical similarity. Deep paraphrases need the pluggable HTTP embedder.
 - pgvector 0.6's HNSW applies `WHERE` filters after the index scan. For very large multi-tenant tables, use partial indexes per large tenant, or pgvector ≥ 0.8 iterative scans.
-- Docker and Kubernetes artifacts were validated statically (YAML parsing plus a ConfigMap-to-loader test), but Docker isn't available in the build environment, so the images weren't built there. CI builds them.
+- The Kubernetes manifests are validated statically (YAML parsing plus a test that loads the ConfigMap through the gateway's config loader) but haven't been applied to a live cluster. The Docker images and the full compose stack are built and tested end to end.

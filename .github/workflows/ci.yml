@@ -91,7 +91,7 @@ jobs:
           path: web/test-results
 
   docker:
-    name: Docker images
+    name: Docker images + compose end-to-end
     runs-on: ubuntu-latest
     needs: [go, web]
     steps:
@@ -122,3 +122,13 @@ jobs:
           tags: ghcr.io/yj3335/llm-gateway-web:${{ github.sha }}
       - name: validate docker compose
         run: docker compose config -q
+      - name: docker compose up (full stack)
+        run: docker compose up -d --build --wait --wait-timeout 300
+      - name: compose end-to-end smoke test
+        run: scripts/compose-smoke.sh
+      - name: compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: compose down
+        if: always()
+        run: docker compose down -v
