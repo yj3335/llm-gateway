@@ -121,6 +121,11 @@ type Options struct {
 	L1MaxEntries        int
 	WriteQueueSize      int
 	WriteWorkers        int
+	// LookupEmbedTimeout bounds embedding on the request path; past it the
+	// semantic tier is skipped for that request (0 = no extra bound).
+	LookupEmbedTimeout time.Duration
+	// WriteTimeout bounds each background write (embedding + Redis + store).
+	WriteTimeout time.Duration
 }
 
 // Cache composes the exact (L1 memory + Redis) and semantic (L2) tiers.
@@ -167,6 +172,9 @@ func New(o Options, emb Embedder, sem SemanticStore, rdb redis.UniversalClient) 
 	}
 	if o.SimilarityThreshold <= 0 {
 		o.SimilarityThreshold = 0.86
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = 60 * time.Second
 	}
 	c := &Cache{opts: o, l1: NewLRU(o.L1MaxEntries, o.TTL), rdb: rdb, sem: sem, embedder: emb,
 		queue: make(chan writeJob, o.WriteQueueSize), hits: map[int64]int64{}, stop: make(chan struct{})}
@@ -253,8 +261,20 @@ func (c *Cache) Lookup(ctx context.Context, k *Key) Result {
 		return done(Result{Status: StatusMiss})
 	}
 	if k.Embedding == nil {
-		v, name, err := embedNamed(ctx, c.embedder, k.PromptText)
+		ectx := ctx
+		if c.opts.LookupEmbedTimeout > 0 {
+			var cancel context.CancelFunc
+			ectx, cancel = context.WithTimeout(ctx, c.opts.LookupEmbedTimeout)
+			defer cancel()
+		}
+		v, name, err := embedNamed(ectx, c.embedder, k.PromptText)
 		if err != nil {
+			// Busy or failed embedder: treat as a miss for this request. The
+			// background write embeds the prompt again without the deadline.
+			if errors.Is(err, ErrEmbedderBusy) || errors.Is(err, context.DeadlineExceeded) {
+				c.report("embed_timeout", err)
+				return done(Result{Status: StatusMiss, Embedder: c.embedder.Name() + " (busy: semantic lookup skipped)"})
+			}
 			c.report("embed", err)
 			return done(Result{Status: StatusMiss})
 		}
@@ -308,7 +328,7 @@ func (c *Cache) Dropped() int64 { return c.dropped.Load() }
 func (c *Cache) writer() {
 	defer c.wg.Done()
 	for j := range c.queue {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), c.opts.WriteTimeout)
 		c.write(ctx, j)
 		cancel()
 		c.pending.Add(-1)

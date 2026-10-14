@@ -529,3 +529,25 @@ func TestInjectedFaultsTripTheBreaker(t *testing.T) {
 		t.Fatalf("open breaker must short-circuit the primary: %+v %v", out, err)
 	}
 }
+
+func TestFaultInjectionRate(t *testing.T) {
+	srv := mockServer(t, fastMock())
+	r := newRouter(t, []Provider{
+		provider(t, "ollama-qwen", "ollama", srv.URL, nil, 5*time.Second),
+		provider(t, "ollama-gemma", "ollama", srv.URL, nil, 5*time.Second),
+	}, BreakerConfig{FailureRateWindow: 200, MinRequests: 200})
+	r.SetFaultRate("ollama-qwen", 0.3)
+	failovers := 0
+	for i := 0; i < 400; i++ {
+		_, out, err := r.Complete(context.Background(), chatReq("q"), CallOptions{}, Chaos{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Failover {
+			failovers++
+		}
+	}
+	if failovers < 80 || failovers > 160 { // 30% of 400 = 120, generous bounds
+		t.Fatalf("expected ~120 injected failovers at rate 0.3, got %d", failovers)
+	}
+}

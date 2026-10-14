@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -191,5 +192,48 @@ func TestPGVectorStoreMixedDimensions(t *testing.T) {
 	k.Embedding = make([]float32, MaxIndexedDims+1)
 	if _, _, err := store.Search(ctx, k, 0.5); err == nil || errors.Is(err, ErrNotFound) {
 		t.Fatal("expected an error for dimensions beyond pgvector's HNSW limit")
+	}
+}
+
+// A slow (busy) embedder must not trigger the fallback: the lookup skips the
+// semantic tier, and the background write still stores a neural embedding.
+func TestSlowEmbedderDoesNotSplitTheCache(t *testing.T) {
+	var delay atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Duration(delay.Load()))
+		var req struct{ Prompt string }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(map[string]any{"embedding": NewHashingEmbedder().embed(req.Prompt)})
+	}))
+	defer srv.Close()
+	fb := NewFallbackEmbedder(NewOllamaEmbedder(srv.URL, "nomic-embed-text", 0, "", time.Second), NewHashingEmbedder(), time.Hour)
+	var fallbacks atomic.Int64
+	fb.OnFallback = func(error) { fallbacks.Add(1) }
+	sem := NewMemoryVectorStore()
+	c := New(Options{SimilarityThreshold: 0.9, LookupEmbedTimeout: 50 * time.Millisecond, WriteWorkers: 1}, fb, sem, nil)
+	t.Cleanup(c.Close)
+	ctx := context.Background()
+
+	delay.Store(int64(200 * time.Millisecond)) // busy: slower than the lookup budget
+	k := BuildKey("t", "m", []Message{{Role: "user", Content: "Explain how Kafka consumer groups work in simple terms."}})
+	r := c.Lookup(ctx, &k)
+	if r.Status != StatusMiss || !strings.Contains(r.Embedder, "busy") || !fb.Healthy() || fallbacks.Load() != 0 {
+		t.Fatalf("busy embedder must skip the lookup without falling back: %+v healthy=%v fallbacks=%d", r, fb.Healthy(), fallbacks.Load())
+	}
+	c.Store(k, &Entry{Content: "answer"}) // background write: no lookup deadline
+	if err := c.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	delay.Store(0)
+	p := BuildKey("t", "m", []Message{{Role: "user", Content: "Can you explain in simple terms how Kafka consumer groups work?"}})
+	if r := c.Lookup(ctx, &p); r.Status != StatusHitSemantic || r.Embedder != "ollama:nomic-embed-text" {
+		t.Fatalf("entry written during the busy period must be a neural embedding: %+v", r)
+	}
+
+	// Offline (connection refused) is different: that does fall back.
+	off := NewFallbackEmbedder(NewOllamaEmbedder("http://127.0.0.1:1/api/embeddings", "nomic-embed-text", 0, "", 200*time.Millisecond), NewHashingEmbedder(), time.Hour)
+	if _, name, err := off.EmbedNamed(ctx, "x"); err != nil || name != "hashing-ngram-384" || off.Healthy() {
+		t.Fatalf("unreachable embedder must fall back: %s %v", name, err)
 	}
 }

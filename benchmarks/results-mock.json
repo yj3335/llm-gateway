@@ -1,0 +1,257 @@
+{
+  "generated_at": "2026-10-14T14:54:19Z",
+  "environment": {
+    "arch": "arm64",
+    "backends": {
+      "api_keys": "postgres+l1",
+      "cache_l1": "memory+redis",
+      "cache_l2": "pgvector",
+      "embedder": "hashing-ngram-384",
+      "ratelimit": "redis-lua"
+    },
+    "cpus": 15,
+    "go": "go1.27.2",
+    "os": "darwin",
+    "topology": "gateway + mockllm + bench client in one process over loopback TCP; Redis 7.4 and PostgreSQL 16 + pgvector 0.6 on localhost"
+  },
+  "config": {
+    "baseline_concurrency": 100,
+    "concurrency": 100,
+    "fallback_similarity_threshold": 0.86,
+    "fault_rate": 0.1,
+    "head_intents": 300,
+    "injection_rate": 0.02,
+    "max_tokens": 48,
+    "mock_tokens": 48,
+    "mock_tpot_ms": 1,
+    "mock_ttft_ms": 120,
+    "mode": "in-process mock upstream",
+    "model_requested": "gpt-4o-mini",
+    "paraphrases_per_intent": 4,
+    "pii_rate": 0.1,
+    "requests": 5000,
+    "seed": 42,
+    "similarity_threshold": 0.86,
+    "unique_rate": 0.25,
+    "zipf_s": 1.1
+  },
+  "upstream_baseline_latency_ms": {
+    "p50": 168.75,
+    "p95": 184.764,
+    "p99": 188.21,
+    "mean": 168.771,
+    "max": 189.539,
+    "n": 500
+  },
+  "mixed_workload": {
+    "requests": 5000,
+    "duration_s": 3.277,
+    "rps": 1525.7,
+    "status_codes": {
+      "200": 4888,
+      "400": 112
+    },
+    "transport_errors": 0,
+    "client_latency_ms": {
+      "all": {
+        "p50": 0.674,
+        "p95": 184.214,
+        "p99": 200.222,
+        "mean": 64.958,
+        "max": 219.437,
+        "n": 4888
+      },
+      "cache_hit": {
+        "p50": 0.458,
+        "p95": 0.931,
+        "p99": 1.593,
+        "mean": 0.523,
+        "max": 4.447,
+        "n": 3019
+      },
+      "cache_miss": {
+        "p50": 169.6,
+        "p95": 187.507,
+        "p99": 210.631,
+        "mean": 169.039,
+        "max": 219.437,
+        "n": 1869
+      }
+    },
+    "gateway_overhead_ms": {
+      "all": {
+        "p50": 0.414,
+        "p95": 1.048,
+        "p99": 23.264,
+        "mean": 0.883,
+        "max": 31.246,
+        "n": 4888
+      },
+      "cache_hit": {
+        "p50": 0.205,
+        "p95": 0.631,
+        "p99": 1.081,
+        "mean": 0.297,
+        "max": 3.821,
+        "n": 3019
+      },
+      "cache_miss": {
+        "p50": 0.555,
+        "p95": 16.42,
+        "p99": 26.581,
+        "mean": 1.83,
+        "max": 31.246,
+        "n": 1869
+      }
+    },
+    "upstream_latency_ms": {
+      "p50": 167.825,
+      "p95": 184.96,
+      "p99": 186.149,
+      "mean": 166.716,
+      "max": 187.922,
+      "n": 1869
+    },
+    "cache_lookup_ms": {
+      "cache_hit": {
+        "p50": 0,
+        "p95": 0.398,
+        "p99": 0.753,
+        "mean": 0.127,
+        "max": 3.309,
+        "n": 3019
+      },
+      "cache_miss": {
+        "p50": 0.366,
+        "p95": 5.486,
+        "p99": 12.874,
+        "mean": 0.992,
+        "max": 21.793,
+        "n": 1869
+      }
+    },
+    "cache": {
+      "lookups": 4888,
+      "hit_ratio_pct": 61.76,
+      "exact_hit_ratio_pct": 38.22,
+      "semantic_hit_ratio_pct": 23.55,
+      "repeated_intent_hit_ratio_pct": 82.62,
+      "semantic_precision_pct": 98.61,
+      "semantic_hits_verified": 1151,
+      "avg_semantic_similarity": 0.9706,
+      "coalesced_requests": 77,
+      "latency_reduction_p50_pct": 99.73,
+      "mean_latency_reduction_vs_uncached_pct": 61.57,
+      "tokens_saved": 224329,
+      "est_cost_saved_usd": 1.6477,
+      "upstream_calls_avoided": 3096,
+      "pgvector_rows_written": 1872
+    },
+    "failover": {
+      "injected_upstream_faults": 188,
+      "upstream_calls": 2010,
+      "failover_responses": 192,
+      "unrecovered_5xx": 0,
+      "failover_success_rate_pct": 100
+    },
+    "guardrails": {
+      "pii_prompts": 561,
+      "pii_redacted": 561,
+      "injection_attempts": 112,
+      "injection_blocked": 112,
+      "false_positive_blocks": 0
+    }
+  },
+  "hot_cache_throughput": {
+    "requests": 20000,
+    "duration_s": 0.665,
+    "rps": 30087.2,
+    "hit_ratio_pct": 100,
+    "client_latency_ms": {
+      "p50": 3.185,
+      "p95": 4.572,
+      "p99": 6.598,
+      "mean": 3.31,
+      "max": 12.386,
+      "n": 20000
+    },
+    "gateway_overhead_ms": {
+      "p50": 1.376,
+      "p95": 2.282,
+      "p99": 3.181,
+      "mean": 1.468,
+      "max": 7.979,
+      "n": 20000
+    }
+  },
+  "provider_health_after_workload": [
+    {
+      "name": "openai",
+      "type": "openai",
+      "state": "CLOSED",
+      "requests": 1822,
+      "failures": 188,
+      "rejected": 0,
+      "error_rate": 0.1,
+      "latency_ewma_ms": 179.28,
+      "latency_p50_ms": 167.41,
+      "latency_p95_ms": 185.03,
+      "last_error": "openai: upstream status 503: {\"error\":{\"type\":\"mock_injected_fault\",\"message\":\"mockllm injected HTTP 503\"}}",
+      "last_error_ago_s": 0.21
+    },
+    {
+      "name": "anthropic",
+      "type": "anthropic",
+      "state": "CLOSED",
+      "requests": 188,
+      "failures": 0,
+      "rejected": 0,
+      "error_rate": 0,
+      "latency_ewma_ms": 166.25,
+      "latency_p50_ms": 167.31,
+      "latency_p95_ms": 184.82
+    },
+    {
+      "name": "gemini",
+      "type": "gemini",
+      "state": "CLOSED",
+      "requests": 0,
+      "failures": 0,
+      "rejected": 0,
+      "error_rate": 0,
+      "latency_ewma_ms": 0,
+      "latency_p50_ms": 0,
+      "latency_p95_ms": 0
+    }
+  ],
+  "guardrail_microbench_us": {
+    "prompt_bytes_3_6k": {
+      "p50": 85.458,
+      "p95": 100.416,
+      "p99": 119.792,
+      "mean": 88.468,
+      "max": 350.416,
+      "n": 2000
+    },
+    "typical_prompt": {
+      "p50": 2.917,
+      "p95": 8.666,
+      "p99": 10.792,
+      "mean": 3.909,
+      "max": 35.084,
+      "n": 20000
+    }
+  },
+  "embedder_microbench_us": {
+    "corpus_max_cross_intent_similarity": 0.8198,
+    "corpus_min_paraphrase_similarity": 0.6341,
+    "embed_latency": {
+      "p50": 2,
+      "p95": 2.792,
+      "p99": 5.666,
+      "mean": 2.264,
+      "max": 2307.75,
+      "n": 20000
+    }
+  }
+}

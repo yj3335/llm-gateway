@@ -104,7 +104,11 @@ type CacheConfig struct {
 	// 0 keeps the model's native size (768 for nomic-embed-text).
 	EmbeddingDimensions int `yaml:"embedding_dimensions"`
 	// EmbeddingPrefix is prepended to every text (some models use task prefixes).
-	EmbeddingPrefix  string        `yaml:"embedding_prefix"`
+	EmbeddingPrefix string `yaml:"embedding_prefix"`
+	// EmbeddingTimeout is the request-path budget for embedding a prompt (and
+	// the connect timeout for detecting an offline embedder). Past it the
+	// semantic lookup is skipped for that request; background cache writes
+	// still embed with a longer deadline.
 	EmbeddingTimeout time.Duration `yaml:"embedding_timeout"`
 	// FallbackSimilarityThreshold applies to entries embedded by the hashing
 	// fallback; SimilarityThreshold applies to the configured embedder.
@@ -125,6 +129,9 @@ type ProviderConfig struct {
 	// ExtraBody fields are added to OpenAI-compatible request bodies unless the
 	// request sets them, e.g. {reasoning_effort: none} to disable "thinking".
 	ExtraBody map[string]any `yaml:"extra_body"`
+	// FaultInjectionRate (chaos testing) fails this fraction of calls to the
+	// provider with a synthetic 503 before they are sent. Keep 0 in production.
+	FaultInjectionRate float64 `yaml:"fault_injection_rate"`
 }
 
 type RouteTarget struct {
@@ -329,6 +336,9 @@ func (c Config) Validate() error {
 		}
 		if names[p.Name] {
 			return fmt.Errorf("duplicate provider %q", p.Name)
+		}
+		if p.FaultInjectionRate < 0 || p.FaultInjectionRate > 1 {
+			return fmt.Errorf("provider %q: fault_injection_rate must be in [0,1]", p.Name)
 		}
 		names[p.Name] = true
 	}

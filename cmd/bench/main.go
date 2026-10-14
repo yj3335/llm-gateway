@@ -44,6 +44,8 @@ type options struct {
 	ttft, tpot                                           time.Duration
 	tokens                                               int
 	redisAddr, pgDSN, out, cpuProfile                    string
+	configPath, model                                    string
+	maxTokens                                            int
 	seed                                                 uint64
 }
 
@@ -66,6 +68,9 @@ func main() {
 	flag.StringVar(&o.out, "out", "benchmarks/results.json", "results file")
 	flag.Uint64Var(&o.seed, "seed", 42, "workload RNG seed")
 	flag.StringVar(&o.cpuProfile, "cpuprofile", "", "write a CPU profile of the mixed-workload phase")
+	flag.StringVar(&o.configPath, "config", "", "gateway config for real upstreams, e.g. configs/gateway.yaml (local Ollama); empty = in-process mock upstream")
+	flag.StringVar(&o.model, "model", "", "model requested by clients (default: gpt-4o-mini for mock, qwen3.5:9b with -config)")
+	flag.IntVar(&o.maxTokens, "max-tokens", 0, "max_tokens per request (default: -tokens for mock, 64 with -config)")
 	flag.Parse()
 
 	if err := run(o); err != nil {
@@ -95,32 +100,66 @@ func run(o options) error {
 	tenant := "bench-" + runID
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	// ---- mock upstream --------------------------------------------------------
-	mock := mockllm.New(mockllm.Config{TTFT: o.ttft, TPOT: o.tpot, Tokens: o.tokens, FailStatus: 503, Jitter: 0.15})
-	ml, mockURL := listen()
-	mockSrv := &http.Server{Handler: mock}
-	go mockSrv.Serve(ml) //nolint:errcheck
-	defer mockSrv.Close()
+	real := o.configPath != ""
+	if o.model == "" {
+		o.model = "gpt-4o-mini"
+		if real {
+			o.model = "qwen3.5:9b"
+		}
+	}
+	if o.maxTokens == 0 {
+		o.maxTokens = o.tokens
+		if real {
+			o.maxTokens = 64
+		}
+	}
+
+	var (
+		mock    *mockllm.Server
+		mockURL string
+		cfg     config.Config
+	)
+	if real {
+		// ---- real upstreams (e.g. local Ollama) ------------------------------------
+		var err error
+		if cfg, err = config.Load(o.configPath); err != nil {
+			return err
+		}
+		if len(cfg.Providers) == 0 {
+			return fmt.Errorf("%s defines no providers", o.configPath)
+		}
+		// 10% of calls to the primary fail with a synthetic 503 (chaos testing).
+		cfg.Providers[0].FaultInjectionRate = o.faultRate
+		cfg.Postgres.MaxConns, cfg.Postgres.MinConns = 32, 16
+	} else {
+		// ---- in-process mock upstream (isolates the gateway itself) -----------------
+		mock = mockllm.New(mockllm.Config{TTFT: o.ttft, TPOT: o.tpot, Tokens: o.tokens, FailStatus: 503, Jitter: 0.15})
+		var ml net.Listener
+		ml, mockURL = listen()
+		mockSrv := &http.Server{Handler: mock}
+		go mockSrv.Serve(ml) //nolint:errcheck
+		defer mockSrv.Close()
+
+		cfg = config.Default()
+		cfg.Providers = []config.ProviderConfig{
+			{Name: "openai", Type: "openai", BaseURL: mockURL, Timeout: 10 * time.Second, Query: map[string]string{"fail_rate": strconv.FormatFloat(o.faultRate, 'f', -1, 64)}},
+			{Name: "anthropic", Type: "anthropic", BaseURL: mockURL, Timeout: 10 * time.Second},
+			{Name: "gemini", Type: "gemini", BaseURL: mockURL, Timeout: 10 * time.Second},
+		}
+		cfg.Routes = []config.RouteConfig{{Match: "*", Targets: []config.RouteTarget{
+			{Provider: "openai"}, {Provider: "anthropic", Model: "claude-3-5-haiku-latest"}, {Provider: "gemini", Model: "gemini-2.0-flash"},
+		}}}
+		cfg.Pricing = map[string]config.Price{"default": {Input: 0.0025, Output: 0.01}}
+		cfg.Postgres.MaxConns, cfg.Postgres.MinConns = 96, 64
+	}
 
 	// ---- gateway ------------------------------------------------------------------
-	cfg := config.Default()
 	cfg.Auth.JWTHMACSecret = "bench-secret-" + runID
 	cfg.Redis.Addr = o.redisAddr
 	cfg.Postgres.DSN = o.pgDSN
 	cfg.Cache.WriteQueueSize = 65536
 	cfg.Cache.WriteWorkers = 8
-	cfg.Postgres.MaxConns = 96
-	cfg.Postgres.MinConns = 64
 	cfg.Telemetry.SampleWindow = 50000
-	cfg.Providers = []config.ProviderConfig{
-		{Name: "openai", Type: "openai", BaseURL: mockURL, Timeout: 10 * time.Second, Query: map[string]string{"fail_rate": strconv.FormatFloat(o.faultRate, 'f', -1, 64)}},
-		{Name: "anthropic", Type: "anthropic", BaseURL: mockURL, Timeout: 10 * time.Second},
-		{Name: "gemini", Type: "gemini", BaseURL: mockURL, Timeout: 10 * time.Second},
-	}
-	cfg.Routes = []config.RouteConfig{{Match: "*", Targets: []config.RouteTarget{
-		{Provider: "openai"}, {Provider: "anthropic", Model: "claude-3-5-haiku-latest"}, {Provider: "gemini", Model: "gemini-2.0-flash"},
-	}}}
-	cfg.Pricing = map[string]config.Price{"default": {Input: 0.0025, Output: 0.01}}
 	gw, cleanup, err := gateway.Build(ctx, cfg, gateway.BuildOptions{Logger: logger, AuditWriter: io.Discard, SkipRedis: o.redisAddr == "", SkipPG: o.pgDSN == ""})
 	if err != nil {
 		return err
@@ -140,24 +179,30 @@ func run(o options) error {
 		return err
 	}
 
-	client := &http.Client{Transport: &http.Transport{MaxIdleConns: o.concurrency * 2, MaxIdleConnsPerHost: o.concurrency * 2, IdleConnTimeout: time.Minute}, Timeout: 60 * time.Second}
-	fmt.Fprintf(os.Stderr, "backends: %v\nmock=%s gateway=%s tenant=%s\n", backends, mockURL, gwURL, tenant)
+	client := &http.Client{Transport: &http.Transport{MaxIdleConns: o.concurrency * 2, MaxIdleConnsPerHost: o.concurrency * 2, IdleConnTimeout: time.Minute}, Timeout: 10 * time.Minute}
+	fmt.Fprintf(os.Stderr, "backends: %v\nmode=%s gateway=%s tenant=%s model=%s max_tokens=%d\n", backends, map[bool]string{true: "real (" + o.configPath + ")", false: "mock " + mockURL}[real], gwURL, tenant, o.model, o.maxTokens)
 
 	// ---- phase 1: direct upstream baseline (no gateway) ------------------------------
-	fmt.Fprintf(os.Stderr, "phase 1: %d direct upstream requests (uncached baseline)\n", o.baseline)
-	baseline := runPhase(o.baseline, o.concurrency, func(i int) sample {
-		body := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"baseline question %d about distributed systems"}]}`, i)
-		return do(client, mockURL+"/v1/chat/completions", "", body, nil)
+	// Real mode: one request at a time straight to the primary model, i.e. pure
+	// model latency without queueing. Mock mode: same concurrency as the workload.
+	baseURL, baseModel, baseConc, baseExtra := mockURL, "gpt-4o-mini", o.concurrency, map[string]any{}
+	if real {
+		baseURL, baseModel, baseConc, baseExtra = strings.TrimRight(cfg.Providers[0].BaseURL, "/"), cfg.Providers[0].DefaultModel, 1, cfg.Providers[0].ExtraBody
+	}
+	fmt.Fprintf(os.Stderr, "phase 1: %d direct upstream requests to %s (uncached baseline, concurrency %d)\n", o.baseline, baseModel, baseConc)
+	baseline := runPhase(o.baseline, baseConc, func(i int) sample {
+		b := map[string]any{"model": baseModel, "max_tokens": o.maxTokens, "messages": []map[string]string{
+			{"role": "system", "content": "You are a concise senior engineer."},
+			{"role": "user", "content": fmt.Sprintf("Baseline question %d: explain one trade-off in distributed systems.", i)}}}
+		for k, v := range baseExtra {
+			b[k] = v
+		}
+		body, _ := json.Marshal(b)
+		return do(client, baseURL+"/v1/chat/completions", "", string(body), nil)
 	})
 
 	// ---- phase 2: mixed workload through the gateway ---------------------------------
 	intents := buildIntents()
-	variantIntent := map[string]int{}
-	for _, in := range intents {
-		for _, v := range in.variants {
-			variantIntent[normalizeEcho(v)] = in.id
-		}
-	}
 	type plan struct {
 		kind   string // head | pii | unique | injection
 		prompt string
@@ -185,7 +230,10 @@ func run(o options) error {
 			plans[i] = p
 		}
 	}
-	mockBefore := mock.Stats()
+	var mockBefore mockllm.Stats
+	if mock != nil {
+		mockBefore = mock.Stats()
+	}
 	fmt.Fprintf(os.Stderr, "phase 2: %d mixed requests x %d workers (fault rate %.0f%%)\n", o.requests, o.concurrency, o.faultRate*100)
 	if o.cpuProfile != "" {
 		f, err := os.Create(o.cpuProfile)
@@ -198,7 +246,7 @@ func run(o options) error {
 	start := time.Now()
 	samples := runPhase(o.requests, o.concurrency, func(i int) sample {
 		p := plans[i]
-		body, _ := json.Marshal(map[string]any{"model": "gpt-4o-mini", "max_tokens": o.tokens, "messages": []map[string]string{
+		body, _ := json.Marshal(map[string]any{"model": o.model, "max_tokens": o.maxTokens, "messages": []map[string]string{
 			{"role": "system", "content": "You are a concise senior engineer."}, {"role": "user", "content": p.prompt},
 		}})
 		s := do(client, gwURL+"/v1/chat/completions", token, string(body), nil)
@@ -209,7 +257,10 @@ func run(o options) error {
 	if o.cpuProfile != "" {
 		pprof.StopCPUProfile()
 	}
-	mockAfter := mock.Stats()
+	var mockAfter mockllm.Stats
+	if mock != nil {
+		mockAfter = mock.Stats()
+	}
 	costSaved := gw.Collector.Summary().Cache.CostSavedUSD
 	providerHealth := gw.Router.Health()
 	if gw.Cache != nil {
@@ -222,14 +273,18 @@ func run(o options) error {
 	var hot *throughput
 	if o.hotRequests > 0 {
 		fmt.Fprintf(os.Stderr, "phase 3: %d hot-cache requests x %d workers\n", o.hotRequests, o.concurrency)
-		warm := intents[:50]
+		nWarm := 50
+		if real {
+			nWarm = 20 // each warm-up miss is a real generation
+		}
+		warm := intents[:nWarm]
 		for _, in := range warm { // ensure warm (exact) entries exist
-			body := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, in.variants[0])
+			body := fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":%q}]}`, o.model, o.maxTokens, in.variants[0])
 			do(client, gwURL+"/v1/chat/completions", token, body, nil)
 		}
 		hs := time.Now()
 		hotSamples := runPhase(o.hotRequests, o.concurrency, func(i int) sample {
-			body := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, warm[i%len(warm)].variants[0])
+			body := fmt.Sprintf(`{"model":%q,"max_tokens":%d,"messages":[{"role":"user","content":%q}]}`, o.model, o.maxTokens, warm[i%len(warm)].variants[0])
 			return do(client, gwURL+"/v1/chat/completions", token, body, nil)
 		})
 		hd := time.Since(hs)
@@ -252,18 +307,40 @@ func run(o options) error {
 	guard := guardrailMicrobench(intents)
 	embed := embedMicrobench(intents)
 
-	res := analyze(o, samples, baseline, elapsed, variantIntent, mockAfter.InjectedFaults-mockBefore.InjectedFaults, mockAfter.Requests-mockBefore.Requests)
+	faults, upstreamCalls := mockAfter.InjectedFaults-mockBefore.InjectedFaults, mockAfter.Requests-mockBefore.Requests
+	if real { // from the gateway's own per-provider accounting
+		faults, upstreamCalls = 0, 0
+		for i, h := range providerHealth {
+			upstreamCalls += h.Requests
+			if i == 0 {
+				faults = h.Failures
+			}
+		}
+	}
+	res := analyze(o, samples, baseline, elapsed, faults, upstreamCalls)
 	res.Workload.Cache.CostSavedUSD = round(costSaved, 4)
 	res.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 	res.Environment = map[string]any{
 		"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH, "cpus": runtime.NumCPU(),
 		"backends": backends, "topology": "gateway + mockllm + bench client in one process over loopback TCP; Redis 7.4 and PostgreSQL 16 + pgvector 0.6 on localhost",
 	}
+	if real {
+		res.Environment["topology"] = "gateway + bench client in one process over loopback TCP; local Ollama (Apple Silicon GPU, generations served one at a time); Redis 7.4 and PostgreSQL 16 + pgvector 0.6 on localhost"
+		var models []string
+		for _, p := range cfg.Providers {
+			models = append(models, p.Name+"="+p.DefaultModel)
+		}
+		res.Environment["upstream_models"] = models
+		res.Environment["embedder"] = cfg.Cache.EmbeddingModel
+	}
 	res.Config = map[string]any{
+		"mode":            map[bool]string{true: "real upstream: " + o.configPath, false: "in-process mock upstream"}[real],
+		"model_requested": o.model, "max_tokens": o.maxTokens, "baseline_concurrency": baseConc,
 		"requests": o.requests, "concurrency": o.concurrency, "fault_rate": o.faultRate, "pii_rate": o.piiRate,
 		"injection_rate": o.injectionRate, "unique_rate": o.uniqueRate, "zipf_s": o.zipfS, "head_intents": len(intents),
 		"paraphrases_per_intent": len(intents[0].variants), "mock_ttft_ms": o.ttft.Milliseconds(), "mock_tpot_ms": float64(o.tpot.Microseconds()) / 1000,
 		"mock_tokens": o.tokens, "similarity_threshold": cfg.Cache.SimilarityThreshold, "seed": o.seed,
+		"fallback_similarity_threshold": cfg.Cache.FallbackSimilarityThreshold,
 	}
 	res.HotCache = hot
 	res.Providers = providerHealth
@@ -487,11 +564,20 @@ type workload struct {
 	} `json:"guardrails"`
 }
 
-var echoPrefix = "[mock] Re: \""
-
-func normalizeEcho(s string) string { return cache.NormalizeText(s) }
-
-func analyze(o options, ss []sample, base []sample, elapsed time.Duration, variantIntent map[string]int, faults, upstreamCalls int64) results {
+func analyze(o options, ss []sample, base []sample, elapsed time.Duration, faults, upstreamCalls int64) results {
+	// Ground truth for semantic precision: every answer in the cache was first
+	// produced by an upstream call (a MISS) for a known intent. Map each such
+	// answer to its intent; a semantic hit is correct when the answer it
+	// returned belongs to the intent that was asked. Works for real models
+	// (no prompt echo needed) and for the mock alike.
+	answerIntent := map[string]int{}
+	for _, s := range ss {
+		if s.status == 200 && s.cache == "MISS" && s.intent >= 0 && s.content != "" {
+			if _, seen := answerIntent[s.content]; !seen {
+				answerIntent[s.content] = s.intent
+			}
+		}
+	}
 	var r results
 	var bl []float64
 	for _, s := range base {
@@ -554,15 +640,11 @@ func analyze(o options, ss []sample, base []sample, elapsed time.Duration, varia
 		case "HIT-SEMANTIC":
 			sem++
 			sims = append(sims, s.similarity)
-			if s.intent >= 0 && strings.HasPrefix(s.content, echoPrefix) {
-				rest := s.content[len(echoPrefix):]
-				if j := strings.Index(rest, "\" —"); j >= 0 {
-					echoed := normalizeEcho(stripPII(rest[:j]))
-					if id, ok := variantIntent[echoed]; ok {
-						verified++
-						if id == s.intent {
-							correct++
-						}
+			if s.intent >= 0 {
+				if id, ok := answerIntent[s.content]; ok {
+					verified++
+					if id == s.intent {
+						correct++
 					}
 				}
 			}
@@ -627,17 +709,6 @@ func analyze(o options, ss []sample, base []sample, elapsed time.Duration, varia
 		f.SuccessRatePct = round(100*float64(f.FailoverResponses)/float64(den), 2)
 	}
 	return r
-}
-
-// stripPII undoes nothing: echoed prompts contain redaction tokens, so we
-// drop everything after the first PII suffix marker to recover the intent.
-func stripPII(s string) string {
-	for _, marker := range []string{" For reference", " Charge it", " You can reach", " My AWS key"} {
-		if i := strings.Index(s, marker); i >= 0 {
-			return s[:i]
-		}
-	}
-	return s
 }
 
 func guardrailMicrobench(intents []intent) map[string]any {

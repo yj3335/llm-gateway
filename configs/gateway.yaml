@@ -58,7 +58,7 @@ cache:
   embedding_model: nomic-embed-text
   embedding_dimensions: 0           # 0 = native 768; smaller values truncate (Matryoshka)
   embedding_prefix: ""              # no task prefix: best paraphrase/near-miss separation for this cache
-  embedding_timeout: 2s
+  embedding_timeout: 2s              # request-path budget; a busy Ollama skips the semantic lookup, never splits the cache
   # Calibrated on paraphrase vs near-miss pairs: nomic paraphrases scored >= 0.948,
   # different questions <= 0.890 (e.g. "TCP congestion control" vs "TCP flow control").
   similarity_threshold: 0.92

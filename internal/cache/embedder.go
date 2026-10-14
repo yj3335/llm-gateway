@@ -16,6 +16,7 @@ import (
 	"hash/fnv"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -209,11 +210,20 @@ type OllamaEmbedder struct {
 }
 
 // NewOllamaEmbedder returns an embedder for a local Ollama server.
-func NewOllamaEmbedder(url, model string, dims int, prefix string, timeout time.Duration) *OllamaEmbedder {
-	if timeout <= 0 {
-		timeout = 2 * time.Second
+// connectTimeout bounds only connection setup, so an offline server is
+// detected quickly; request duration is bounded by the caller's context
+// (a busy server may legitimately take a while).
+func NewOllamaEmbedder(url, model string, dims int, prefix string, connectTimeout time.Duration) *OllamaEmbedder {
+	if connectTimeout <= 0 {
+		connectTimeout = 2 * time.Second
 	}
-	return &OllamaEmbedder{URL: url, Model: model, Prefix: prefix, Dims: dims, Client: &http.Client{Timeout: timeout}}
+	tr := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	return &OllamaEmbedder{URL: url, Model: model, Prefix: prefix, Dims: dims, Client: &http.Client{Transport: tr}}
 }
 
 // Name identifies the model (and truncation) so incompatible vectors are
@@ -266,8 +276,14 @@ func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 }
 
 // FallbackEmbedder uses Primary (e.g. Ollama) and switches to Secondary
-// (the deterministic hashing embedder) when Primary fails, retrying Primary
-// after Backoff. The cache keeps each embedder's entries separate.
+// (the deterministic hashing embedder) when Primary is *unavailable*
+// (connection refused, unreachable host, error response), retrying Primary
+// after Backoff. A Primary that is merely *slow* (the caller's deadline
+// expired, e.g. while a local model is busy generating) does not trigger the
+// fallback: the error is returned so the caller can skip the semantic lookup
+// for that one request. Switching on slowness would split the cache across
+// two embedding spaces that can never match each other.
+// The cache keeps each embedder's entries separate.
 type FallbackEmbedder struct {
 	Primary, Secondary Embedder
 	Backoff            time.Duration
@@ -305,8 +321,8 @@ func (f *FallbackEmbedder) EmbedNamed(ctx context.Context, text string) ([]float
 		if err == nil {
 			return v, name, nil
 		}
-		if ctx.Err() != nil {
-			return nil, "", ctx.Err()
+		if ctx.Err() != nil || isBusy(err) {
+			return nil, "", fmt.Errorf("%w: %v", ErrEmbedderBusy, err)
 		}
 		f.downUntil.Store(time.Now().Add(f.Backoff).UnixNano())
 		if f.OnFallback != nil {
@@ -316,6 +332,25 @@ func (f *FallbackEmbedder) EmbedNamed(ctx context.Context, text string) ([]float
 		f.OnFallback(nil)
 	}
 	return embedNamed(ctx, f.Secondary, text)
+}
+
+// ErrEmbedderBusy reports that the embedder did not answer within the
+// caller's deadline although it is reachable.
+var ErrEmbedderBusy = errors.New("embedder busy")
+
+// isBusy reports a timeout that is not a connection failure: the server
+// accepted the request but did not answer in time.
+func isBusy(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		var op *net.OpError
+		return !(errors.As(err, &op) && op.Op == "dial")
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		var op *net.OpError
+		return !(errors.As(err, &op) && op.Op == "dial")
+	}
+	return false
 }
 
 func normalizeInPlace(v []float32) {

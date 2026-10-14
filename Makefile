@@ -15,7 +15,7 @@ include .env
 export
 endif
 
-.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-quick k6 run run-mock ollama-pull ollama-check up down compose-test k8s-deploy k8s-test runtime-up runtime-up-k8s runtime-stop runtime-down runtime-status web-dev fmt vet clean
+.PHONY: help venv services services-down build test test-go test-web e2e e2e-live bench bench-mock bench-quick k6 run run-mock ollama-pull ollama-check up down compose-test k8s-deploy k8s-test runtime-up runtime-up-k8s runtime-stop runtime-down runtime-status web-dev fmt vet clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -54,8 +54,11 @@ e2e: ## Playwright E2E (mocked gateway)
 e2e-live: ## Playwright E2E against a running gateway on :8080 (make run-mock)
 	$(VENV) cd web && npm run build && CI=1 E2E_LIVE=1 npx playwright test
 
-bench: services ## Real benchmark (5,000 req x 100 workers) -> benchmarks/results.json
-	$(VENV) go run ./cmd/bench -requests 5000 -concurrency 100 -redis $(REDIS_ADDR) -postgres "$(PG_DSN)" -out benchmarks/results.json
+bench: services ## Real-model benchmark through local Ollama (1,000 req x 4 clients) -> benchmarks/results.json
+	$(VENV) go run ./cmd/bench -config $(CONFIG) -requests 1000 -concurrency 4 -baseline 20 -redis $(REDIS_ADDR) -postgres "$(PG_DSN)" -out benchmarks/results.json
+
+bench-mock: services ## Gateway-capacity benchmark with the mock upstream (5,000 req x 100) -> benchmarks/results-mock.json
+	$(VENV) go run ./cmd/bench -requests 5000 -concurrency 100 -redis $(REDIS_ADDR) -postgres "$(PG_DSN)" -out benchmarks/results-mock.json
 
 bench-quick: services ## Smaller benchmark run (not written to results.json)
 	$(VENV) go run ./cmd/bench -requests 1000 -concurrency 50 -hot-requests 2000 -out /tmp/llmgw-bench-quick.json

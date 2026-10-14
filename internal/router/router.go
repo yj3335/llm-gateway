@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strings"
@@ -67,7 +68,10 @@ type Chaos struct {
 // inside the gateway, so chaos drills work against any upstream (real
 // providers and local Ollama ignore test headers). The failure flows through
 // the normal path: it is recorded by the circuit breaker and triggers failover.
-func injectedFault(i int, provider string, chaos Chaos) error {
+func (r *Router) injectedFault(i int, provider string, chaos Chaos) error {
+	if rate := r.faultRates[provider]; rate > 0 && rand.Float64() < rate {
+		return &UpstreamError{Provider: provider, Status: http.StatusServiceUnavailable, Body: "fault injected by fault_injection_rate"}
+	}
 	if i != 0 {
 		return nil
 	}
@@ -89,6 +93,17 @@ type Router struct {
 
 	mu    sync.Mutex
 	stats map[string]*providerStats
+
+	faultRates map[string]float64 // chaos testing: synthetic failure rate per provider
+}
+
+// SetFaultRate makes a fraction of calls to provider fail with a synthetic
+// 503 (chaos testing). Call before serving traffic.
+func (r *Router) SetFaultRate(provider string, rate float64) {
+	if r.faultRates == nil {
+		r.faultRates = map[string]float64{}
+	}
+	r.faultRates[provider] = rate
 }
 
 type providerStats struct {
@@ -199,7 +214,7 @@ func (r *Router) Complete(ctx context.Context, req *ChatRequest, base CallOption
 		preq := r.prepare(t, req)
 		start := time.Now()
 		var c *Completion
-		cerr := injectedFault(i, t.Provider, chaos)
+		cerr := r.injectedFault(i, t.Provider, chaos)
 		if cerr == nil {
 			c, cerr = p.Complete(ctx, preq, base)
 		}
@@ -254,7 +269,7 @@ func (r *Router) Stream(ctx context.Context, req *ChatRequest, base CallOptions,
 		preq := r.prepare(t, req)
 		start := time.Now()
 		var s Stream
-		serr := injectedFault(i, t.Provider, chaos)
+		serr := r.injectedFault(i, t.Provider, chaos)
 		if serr == nil {
 			s, serr = p.Stream(ctx, preq, base)
 		}

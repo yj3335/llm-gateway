@@ -225,7 +225,8 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 		}
 		c = cache.New(cache.Options{
 			SimilarityThreshold: cfg.Cache.SimilarityThreshold, Thresholds: thresholds, TTL: cfg.Cache.TTL, L1MaxEntries: cfg.Cache.L1MaxEntries,
-			WriteQueueSize: cfg.Cache.WriteQueueSize, WriteWorkers: cfg.Cache.WriteWorkers,
+			LookupEmbedTimeout: cfg.Cache.EmbeddingTimeout,
+			WriteQueueSize:     cfg.Cache.WriteQueueSize, WriteWorkers: cfg.Cache.WriteWorkers,
 		}, emb, sem, exact)
 		c.OnError = func(op string, err error) {
 			metrics.CacheBackendErrors.WithLabelValues(op).Inc()
@@ -282,6 +283,12 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 	if err != nil {
 		cleanup()
 		return nil, nil, err
+	}
+	for _, pc := range cfg.Providers {
+		if pc.FaultInjectionRate > 0 {
+			rtr.SetFaultRate(pc.Name, pc.FaultInjectionRate)
+			log.Warn("chaos: fault injection enabled", "provider", pc.Name, "rate", pc.FaultInjectionRate)
+		}
 	}
 	collector.SetProviderSource(func() any { return rtr.Health() })
 	collector.SetBackends(backends)
