@@ -52,8 +52,15 @@ check "every replica connected to Postgres (pgvector) and Redis" '[ "$degraded" 
 echo "== port-forwards (ingress-nginx, web)"
 forward svc/ingress-nginx-controller "$ING_PORT:80" ingress-nginx
 forward svc/llm-gateway-web "$WEB_PORT:80"
-for _ in $(seq 1 30); do curl -s "${ICURL[@]}" -o /dev/null "http://$HOST/healthz" && curl -s -o /dev/null "http://localhost:$WEB_PORT/" && break; sleep 1; done
-check "Ingress routes $HOST to the gateway Service" '[ "$(curl -s "${ICURL[@]}" -o /dev/null -w "%{http_code}" http://$HOST/readyz)" = 200 ]'
+# Wait for a real 200, not just any response: ingress-nginx answers 404/503
+# for a few seconds until it has loaded a freshly applied Ingress.
+code=000
+for _ in $(seq 1 120); do
+  code=$(curl -s "${ICURL[@]}" -o /dev/null -w "%{http_code}" "http://$HOST/readyz")
+  [ "$code" = 200 ] && curl -sf -o /dev/null "http://localhost:$WEB_PORT/" && break
+  sleep 1
+done
+check "Ingress routes $HOST to the gateway Service" '[ "$code" = 200 ]' "last status: $code"
 
 echo "== functional smoke test through the Ingress (load-balanced across replicas)"
 before=$(for p in $(gw_pods); do k logs "$p" | grep -c '"msg":"request"'; done | paste -sd' ' -)
