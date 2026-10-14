@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -449,5 +450,82 @@ func TestRouteMatching(t *testing.T) {
 	}
 	if _, err := New([]Provider{a}, []Route{{Match: "*", Targets: []Target{{Provider: "nope"}}}}, BreakerConfig{}, nil); err == nil {
 		t.Fatal("expected unknown provider error")
+	}
+}
+
+func TestExtraBodyMergedIntoOpenAIRequests(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"model":"qwen3.5:9b","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+	p, _ := NewProvider(ProviderSpec{Name: "ollama-qwen", Type: "ollama", BaseURL: srv.URL, DefaultModel: "qwen3.5:9b",
+		ExtraBody: map[string]any{"reasoning_effort": "none", "temperature": 0.1}}, nil)
+	temp := 0.7
+	req := chatReq("hi")
+	req.Model, req.Temperature = "", &temp
+	if _, err := p.Complete(context.Background(), req, CallOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got["reasoning_effort"] != "none" || got["temperature"] != 0.7 || got["model"] != "qwen3.5:9b" {
+		t.Fatalf("extra_body must add missing fields without overriding the request: %v", got)
+	}
+}
+
+// Chaos faults are synthesized in the gateway, so they work with real
+// upstreams (e.g. Ollama) that ignore test headers: the primary is not called.
+func TestInjectedFaultsSkipTheUpstream(t *testing.T) {
+	var primaryCalls atomic.Int64
+	primarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		mockllm.New(fastMock()).ServeHTTP(w, r)
+	}))
+	defer primarySrv.Close()
+	fallback := mockServer(t, fastMock())
+	r := newRouter(t, []Provider{
+		provider(t, "ollama-qwen", "ollama", primarySrv.URL, nil, 5*time.Second),
+		provider(t, "ollama-gemma", "ollama", fallback.URL, nil, 5*time.Second),
+	}, BreakerConfig{})
+
+	for _, tc := range []struct {
+		name  string
+		chaos Chaos
+		check func(Attempt) bool
+	}{
+		{"503", Chaos{FailPrimary: true}, func(a Attempt) bool { return a.Status == 503 }},
+		{"timeout", Chaos{TimeoutPrimary: true}, func(a Attempt) bool { return strings.Contains(a.Error, "timeout") }},
+	} {
+		_, out, err := r.Complete(context.Background(), chatReq("q"), CallOptions{}, tc.chaos)
+		if err != nil || out.Provider != "ollama-gemma" || !out.Failover || !tc.check(out.Attempts[0]) {
+			t.Fatalf("%s: expected failover to ollama-gemma: %+v %v", tc.name, out, err)
+		}
+		s, sout, err := r.Stream(context.Background(), chatReq("q"), CallOptions{}, tc.chaos)
+		if err != nil || sout.Provider != "ollama-gemma" {
+			t.Fatalf("%s stream: %+v %v", tc.name, sout, err)
+		}
+		drain(t, s)
+	}
+	if primaryCalls.Load() != 0 {
+		t.Fatalf("injected faults must not reach the primary upstream; it got %d calls", primaryCalls.Load())
+	}
+}
+
+// Repeated injected faults trip the primary's breaker; traffic then skips it.
+func TestInjectedFaultsTripTheBreaker(t *testing.T) {
+	srv := mockServer(t, fastMock())
+	r := newRouter(t, []Provider{
+		provider(t, "ollama-qwen", "ollama", srv.URL, nil, 5*time.Second),
+		provider(t, "ollama-gemma", "ollama", srv.URL, nil, 5*time.Second),
+	}, BreakerConfig{FailureRateWindow: 20, MinRequests: 10, FailureRate: 0.5, OpenTimeout: time.Hour})
+	for i := 0; i < 10; i++ {
+		_, _, _ = r.Complete(context.Background(), chatReq("q"), CallOptions{}, Chaos{FailPrimary: true})
+	}
+	if st := r.Breaker("ollama-qwen").State(); st != StateOpen {
+		t.Fatalf("expected OPEN after 10 injected faults, got %s", st)
+	}
+	_, out, err := r.Complete(context.Background(), chatReq("q"), CallOptions{}, Chaos{})
+	if err != nil || out.Provider != "ollama-gemma" || !out.Attempts[0].Skipped {
+		t.Fatalf("open breaker must short-circuit the primary: %+v %v", out, err)
 	}
 }

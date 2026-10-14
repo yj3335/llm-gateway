@@ -26,6 +26,9 @@ type ProviderSpec struct {
 	DefaultModel string
 	Query        map[string]string
 	Headers      map[string]string
+	// ExtraBody fields are added to OpenAI-compatible request bodies unless the
+	// request already sets them (e.g. reasoning_effort: none for local models).
+	ExtraBody map[string]any
 }
 
 // NewProvider builds the adapter for spec.Type.
@@ -166,6 +169,11 @@ func (p *openAIProvider) body(req *ChatRequest, stream bool) map[string]any {
 	}
 	if len(req.Stop) > 0 {
 		b["stop"] = req.Stop
+	}
+	for k, v := range p.spec.ExtraBody {
+		if _, set := b[k]; !set {
+			b[k] = v
+		}
 	}
 	return b
 }

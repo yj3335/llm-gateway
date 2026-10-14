@@ -1,6 +1,6 @@
 # LLM Gateway, Cache and Guardrails
 
-A high-throughput, cloud-native **LLM semantic gateway** written in Go: an OpenAI-compatible proxy that sits in front of OpenAI, Anthropic, Gemini, and Ollama. It provides:
+A high-throughput, cloud-native **LLM semantic gateway** written in Go: an OpenAI-compatible proxy that sits in front of OpenAI, Anthropic, Gemini, and Ollama. **By default it runs entirely on local Ollama models with zero paid API keys:** `qwen3.5:9b` as the primary model, `gemma4:e4b` as the automatic fallback, and `nomic-embed-text` embeddings for the semantic cache. It provides:
 
 - multi-tenant auth,
 - an atomic Redis dual token-bucket rate limiter (RPM + TPM),
@@ -10,7 +10,7 @@ A high-throughput, cloud-native **LLM semantic gateway** written in Go: an OpenA
 
 A **Next.js + TypeScript control plane** streams live telemetry and includes an interactive playground.
 
-Every number in this README was **measured**. Benchmark figures come from `cmd/bench` and are stored in [`benchmarks/results.json`](benchmarks/results.json). Docker, Kubernetes and k6 figures come from `scripts/compose-smoke.sh`, `scripts/k8s-smoke.sh` and `benchmarks/k6-load-test.js`.
+Every number in this README was **measured**. Benchmark figures come from `cmd/bench` and are stored in [`benchmarks/results.json`](benchmarks/results.json); that benchmark isolates the gateway with the bundled mock upstream and the hashing embedder. Local-model figures come from `make ollama-check`, and Docker, Kubernetes and k6 figures come from `scripts/compose-smoke.sh`, `scripts/k8s-smoke.sh` and `benchmarks/k6-load-test.js`.
 
 ---
 
@@ -30,6 +30,7 @@ Workload: 5,000 requests across 100 concurrent workers, real Redis 7.4 and Postg
 | Guardrails | 561/561 PII prompts redacted · 112/112 injections blocked · **0 false positives** |
 | Guardrail latency | **2.9 µs** p50 typical prompt · **121 µs** p99 for a 3.6 KB PII-laden prompt |
 | Kubernetes availability | Rolling restart of all 3 replicas: **590 requests, 0 failures** · pod killed under load: **0 failures** |
+| Local models, zero API keys | `qwen3.5:9b` → `gemma4:e4b` failover and `nomic-embed-text` semantic cache via Ollama: **9/9 live checks** (paraphrase hit at 0.973 similarity, near-miss rejected) |
 
 ---
 
@@ -45,17 +46,17 @@ flowchart LR
       RL[Redis Lua Dual Token Bucket<br/>RPM + TPM, atomic<br/><i>local fallback if Redis down</i>] --> G
       G[Responsible-AI Guardrail<br/>PII regex + Luhn · injection scoring<br/>REDACT / BLOCK, under 1 ms] --> L1
       L1[L1 Exact Cache<br/>sharded LRU → Redis] -->|miss| L2
-      L2[L2 Semantic Cache<br/>384-d embedding → pgvector HNSW<br/>cosine ≥ 0.86] -->|miss| SF
+      L2[L2 Semantic Cache<br/>nomic-embed-text 768-d via Ollama<br/>hashing 384-d fallback<br/>pgvector HNSW per dimension] -->|miss| SF
       SF[Request Coalescing<br/>singleflight per prompt] --> R
       R[Circuit-Breaking Multi-Provider Router<br/>CLOSED · OPEN · HALF-OPEN] --> OG
       OG[Output Guardrail<br/>streaming-safe redaction] -.write-behind.-> L1 & L2
     end
 
-    R -->|primary| P1[(OpenAI)]
-    R -.failover.-> P2[(Anthropic)]
-    R -.failover.-> P3[(Gemini)]
-    R -.failover.-> P4[(Ollama)]
-    R -.local dev/bench.-> M[(MockLLM :8090)]
+    R -->|primary| Q[(Ollama: qwen3.5:9b)]
+    R -.failover.-> GM[(Ollama: gemma4:e4b)]
+    L2 -.embeddings.-> NE[(Ollama: nomic-embed-text)]
+    R -.optional.-> P1[(OpenAI / Anthropic / Gemini)]
+    R -.CI / bench.-> M[(MockLLM :8090)]
 
     GW --> T[Telemetry<br/>Prometheus /metrics · JSON audit log<br/>/v1/telemetry/summary · SSE stream]
     T --> UI[Next.js Control Plane :3000]
@@ -72,9 +73,9 @@ flowchart LR
 1. **Auth** (`internal/auth`): accepts `Authorization: Bearer <JWT>` signed with HS256, RS256 with a static PEM key, or RS256 from an OAuth2/OIDC **JWKS** endpoint (with key rotation by `kid`). It also accepts `X-API-Key`, looked up through **L1 memory → Redis → PostgreSQL**. Keys are stored only as SHA-256 hashes, and unknown keys are negatively cached. The JWT claims `tenant_id`, `tier`, `rpm_limit`, `tpm_limit`, and `pii_mode` define the tenant policy.
 2. **Rate limit** (`internal/ratelimit`): one **atomic Lua script** refills and checks *both* buckets using the Redis server clock, and debits them only if **both** have capacity. TPM is charged with an estimate (prompt chars/4 + `max_tokens`) and **reconciled** after the response; cache hits are refunded in full. Bucket keys use `{tenant}` hash tags, so they're safe on Redis Cluster. If Redis errors, a sharded in-process bucket takes over and Redis is retried after a backoff.
 3. **Guardrails** (`internal/guardrails`): PII detection uses regexes, **Luhn + IIN** validation for cards, SSN area/group/serial rules, emails, phones, AWS keys, and OpenAI/GitHub/Slack/Google API keys. Matches are redacted (`[REDACTED_SSN]`, …) or blocked (`400 PII_DETECTED`) according to the tenant's mode. The injection firewall combines 11 weighted heuristics with a noisy-OR. They run over leetspeak-folded and spaced-letter-collapsed text, plus delimiter and chat-template tokens, role spoofing, and **base64-encoded payloads**, which are decoded and re-scored. Prompts at or above 0.70 are blocked (`400 PROMPT_INJECTION`).
-4. **Cache** (`internal/cache`): the **exact** key is `sha256(tenant, model, normalized conversation)`. The **semantic** lookup embeds the final user turn and searches pgvector, scoped by tenant, model, and a **scope hash** of the system prompt and prior turns, so a paraphrase can only match an identical context. Writes are asynchronous (write-behind), and PII is redacted *before* anything is cached.
+4. **Cache** (`internal/cache`): the **exact** key is `sha256(tenant, model, normalized conversation)`. The **semantic** lookup embeds the final user turn with `nomic-embed-text` (768-d) on local Ollama and searches pgvector, scoped by tenant, model, a **scope hash** of the system prompt and prior turns, and the **embedder** that produced the vector. If Ollama's embedder is unreachable, a deterministic hashing embedder (384-d) takes over; vectors from different embedders are never compared, and each embedder has its own calibrated threshold (0.92 for nomic, 0.86 for hashing). Writes are asynchronous (write-behind), and PII is redacted *before* anything is cached.
 5. **Coalescing:** concurrent identical misses share one upstream call through `singleflight`. In tests, 25 concurrent identical requests produced exactly 1 upstream call.
-6. **Router** (`internal/router`): adapters translate OpenAI ⇄ Anthropic Messages ⇄ Gemini `generateContent`, for both JSON and SSE. A `5xx`, `429`, timeout, or transport error fails over to the next target; other `4xx` errors don't and never trip the breaker. Streams fail over before the first byte is relayed.
+6. **Router** (`internal/router`): adapters translate OpenAI ⇄ Anthropic Messages ⇄ Gemini `generateContent`, for both JSON and SSE; Ollama uses its OpenAI-compatible endpoint, with per-provider `extra_body` (for example `reasoning_effort: none`). A `5xx`, `429`, timeout, or transport error fails over to the next target; other `4xx` errors don't and never trip the breaker. Streams fail over before the first byte is relayed. Chaos drills (`X-Gateway-Chaos: fail-primary | timeout-primary`) are synthesized inside the gateway, so they work against any upstream, including local Ollama.
 7. **Output guardrails:** JSON responses are redacted directly. Streams go through a holdback-window redactor that catches PII split across chunk boundaries, with tests at 1-, 3-, 7-, 16-, and 64-byte chunk sizes.
 
 ### Response headers
@@ -83,11 +84,50 @@ flowchart LR
 |---|---|
 | `X-Gateway-Cache` | `HIT-EXACT` · `HIT-SEMANTIC` · `MISS` · `BYPASS` |
 | `X-Gateway-Cache-Similarity`, `X-Gateway-Cache-Layer` | cosine score; `memory` / `redis` / `pgvector` |
-| `X-Gateway-Provider`, `X-Gateway-Provider-Failover` | serving provider; `true` if a fallback served the request |
+| `X-Gateway-Embedder` | embedder used for the semantic lookup, e.g. `ollama:nomic-embed-text` or `hashing-ngram-384` (fallback) |
+| `X-Gateway-Provider`, `X-Gateway-Upstream-Model`, `X-Gateway-Provider-Failover`, `X-Gateway-Attempts` | serving provider and model; `true` if a fallback served the request; upstream attempts |
 | `X-Gateway-Overhead-Ms`, `X-Gateway-Upstream-Latency-Ms`, `X-Gateway-Total-Latency-Ms` | latency breakdown |
 | `X-Gateway-Guardrail`, `X-Gateway-Guardrail-Categories` | `REDACT` / `BLOCK` / `FLAG`; e.g. `CREDIT_CARD,SSN` |
 | `X-RateLimit-Limit-Requests`, `X-RateLimit-Remaining-Requests`, `X-RateLimit-Limit-Tokens`, `X-RateLimit-Remaining-Tokens`, `X-RateLimit-Reset`, `Retry-After` | standard quota headers (429 on exhaustion) |
 | `X-Gateway-Tokens-Saved`, `X-Gateway-Coalesced`, `X-Request-ID` | savings, coalescing, tracing |
+
+---
+
+## Local models with Ollama (zero paid API keys)
+
+`configs/gateway.yaml` (the default) runs everything on a local [Ollama](https://ollama.com) server:
+
+| Role | Model | Notes |
+|---|---|---|
+| Primary chat model | `qwen3.5:9b` | provider `ollama-qwen`, OpenAI-compatible `/v1/chat/completions` |
+| Fallback chat model | `gemma4:e4b` | provider `ollama-gemma`; `gemma4:12b` also works if memory allows |
+| Semantic-cache embeddings | `nomic-embed-text` | `/api/embeddings`, 768 dimensions, normalized by the gateway |
+
+```bash
+make ollama-pull     # ollama pull qwen3.5:9b gemma4:e4b nomic-embed-text
+make run             # gateway on :8080 with configs/gateway.yaml
+make ollama-check    # live integration test through your local Ollama
+```
+
+The gateway also exposes an OpenAI-compatible **`POST /v1/embeddings`** that serves the configured embedder (authenticated and rate-limited like chat).
+
+**`make ollama-check` (live, on an Apple Silicon laptop with real Redis and pgvector): 9/9 checks pass in about 12 s.**
+
+| Check | Measured result |
+|---|---|
+| Chat completion through `qwen3.5:9b` | real answer in ~1.0–1.2 s (warm model) |
+| Streaming through `qwen3.5:9b` | OpenAI-format SSE chunks with content |
+| `POST /v1/embeddings` | 768-dimension `nomic-embed-text` vector, unit norm |
+| Paraphrase served from the neural semantic cache | `HIT-SEMANTIC` through pgvector, similarity 0.973 |
+| Near-miss ("TCP congestion control" vs "TCP flow control") | `MISS`: not served a wrong cached answer |
+| Injected 503 on Qwen | answered by `gemma4:e4b`, `X-Gateway-Provider-Failover: true` |
+| Injected timeout on Qwen | answered by `gemma4:e4b` |
+| Circuit breaker | trips OPEN after repeated faults; Qwen short-circuited; recovers OPEN → HALF-OPEN → CLOSED |
+| Embedder offline | chat still answered by Qwen; cache and `/v1/embeddings` use the hashing fallback; `/readyz` reports `embedder: degraded` |
+
+**Calibration.** `nomic-embed-text` similarities live on a different scale from the hashing embedder. On paraphrase and near-miss pairs, paraphrases scored ≥ 0.948 and different questions ≤ 0.890, so the nomic threshold is **0.92** (the hashing embedder keeps 0.86). No task prefix gave the widest gap for question-to-question matching.
+
+**Containers.** `LLMGW_OLLAMA_URL` rewrites `http://localhost:11434` in the config, e.g. `http://host.docker.internal:11434` for a gateway in Docker (see `.env.example`). Docker Compose, CI, the Kubernetes overlay and the benchmark use `configs/gateway.mock.yaml`, so they run without model downloads.
 
 ---
 
@@ -119,6 +159,11 @@ Every issue below was found by a measurement, a test, or a real deployment, not 
 | 12 | Local cluster | The production Ingress had no controller. | Colima's k3s disables Traefik and ships no Ingress controller. | Install the official ingress-nginx, the class the manifest targets (automated in `make runtime-up-k8s` and CI). |
 | 13 | Browser tests | Playwright tests crashed on click ("GPU process isn't usable") on recent macOS. | The stripped-down Chromium headless shell fails there. | Playwright uses full Chromium in new-headless mode with `--disable-gpu`. |
 | 14 | Docker build | Risk: a lower Go base image (for example 1.24) would fail at `go mod download`. | go-redis and `golang.org/x/*` require Go ≥ 1.26, and `go.mod` declares 1.27.2. | Builder pinned to `golang:1.27.2-alpine`, matching `go.mod` exactly. All base-image tags were verified against their registries. |
+| 15 | Local models | Qwen 3.5 and Gemma 4 returned **empty answers** (`finish_reason: length`). | Both "think" by default and spent the whole `max_tokens` budget on reasoning. Ollama's native `think: false` is ignored on its OpenAI-compatible endpoint. | Per-provider `extra_body: {reasoning_effort: none}` (the OpenAI-standard field Ollama honors). A config test enforces it. |
+| 16 | Embeddings | Vectors from Ollama's `/api/embeddings` had norm ≈ 22.8. | The legacy endpoint returns unnormalized vectors. | The embedder L2-normalizes (and optionally truncates, Matryoshka-style) before storing. |
+| 17 | Semantic cache | With the hashing threshold (0.86), nomic would have served "TCP flow control" the cached answer for "TCP congestion control" (similarity 0.890). | Each embedder has its own similarity scale; a 768-d neural vector and a 384-d hashing vector are also incomparable. | Per-embedder thresholds (nomic 0.92, calibrated), entries scoped by embedder, and a dimensionless `vector` column with one partial HNSW index per dimension. Migration `002` upgrades existing databases; a test applies it to the original schema. |
+| 18 | Chaos drills | `X-Gateway-Chaos: fail-primary` would not fail a real provider. | The drill forwarded `X-Mock-Fail`, which only the mock upstream honors; Ollama ignores it. | Faults (503 and timeout) are synthesized inside the gateway and flow through the breaker and failover like real failures. |
+| 19 | Response headers | Non-streaming responses lacked `X-Gateway-Upstream-Model` and `X-Gateway-Attempts`. | Only the streaming path set them; mock-based tests never asserted them. Found by the live Ollama check. | Set on every response; the gateway test now asserts them. |
 
 ---
 
@@ -190,7 +235,7 @@ docker compose up --build
 # Prometheus  http://localhost:9090
 ```
 
-Compose starts `pgvector/pgvector:pg16`, Redis 7, MockLLM, the gateway, Prometheus, and the web UI. Set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GEMINI_API_KEY`, and point the `providers[].base_url` values in `configs/gateway.yaml` at real endpoints to use live models.
+Compose starts `pgvector/pgvector:pg16`, Redis 7, MockLLM, the gateway, Prometheus, and the web UI, using `configs/gateway.mock.yaml` so no models are needed. To serve your local Ollama models from the containerized gateway instead, start it with `LLMGW_GATEWAY_CONFIG=/etc/llm-gateway/gateway.yaml`; the gateway reaches Ollama at `http://host.docker.internal:11434` (`LLMGW_OLLAMA_URL`).
 
 Verify the running stack end to end:
 
@@ -207,7 +252,9 @@ make venv          # bootstrap the toolchain into .venv, install web deps + Chro
 make test          # Go (-race, real Redis + pgvector) + TypeScript + Jest
 make e2e           # Playwright E2E
 make bench         # real benchmark -> benchmarks/results.json
-make run           # local Postgres + Redis, mockllm :8090, gateway :8080
+make run           # local Postgres + Redis, gateway :8080 on local Ollama models
+make run-mock      # same, but with the bundled mock upstream (no model downloads)
+make ollama-check  # live integration test through local Ollama
 make web-dev       # dashboard on :3000 (in another terminal)
 ```
 
@@ -217,19 +264,22 @@ make web-dev       # dashboard on :3000 (in another terminal)
 TOKEN=$(curl -s -XPOST localhost:8080/v1/auth/token -d '{"tenant_id":"demo"}' | jq -r .access_token)
 
 curl -si localhost:8080/v1/chat/completions -H "Authorization: Bearer $TOKEN" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Explain how Kafka consumer groups work in simple terms."}]}' | grep -i x-gateway
+  -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"Explain how Kafka consumer groups work in simple terms."}]}' | grep -i x-gateway
 
 # Paraphrase -> X-Gateway-Cache: HIT-SEMANTIC (pgvector)
 curl -si localhost:8080/v1/chat/completions -H "Authorization: Bearer $TOKEN" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Can you explain in simple terms how Kafka consumer groups work?"}]}' | grep -i x-gateway-cache
+  -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"Can you explain in simple terms how Kafka consumer groups work?"}]}' | grep -i x-gateway-cache
 
-# Failover drill (chaos headers are dev-only)
+# Failover drill: Qwen fails, Gemma answers (chaos headers are dev-only; also: timeout-primary)
 curl -si localhost:8080/v1/chat/completions -H "Authorization: Bearer $TOKEN" -H "X-Gateway-Chaos: fail-primary" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}' | grep -i provider
+  -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"hi"}]}' | grep -iE "provider|upstream-model"
+
+# Embeddings through the gateway (nomic-embed-text, 768-d)
+curl -s localhost:8080/v1/embeddings -H "Authorization: Bearer $TOKEN" -d '{"input":"hello"}' | jq '.model, (.data[0].embedding | length)'
 
 # API-key tenant configured with BLOCK mode -> HTTP 400 PII_DETECTED
 curl -s localhost:8080/v1/chat/completions -H "X-API-Key: gw-demo-key-block" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}'
+  -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"My SSN is 123-45-6789"}]}'
 ```
 
 Streaming works with `"stream": true`, which returns OpenAI-format SSE regardless of the upstream provider's wire format.
@@ -240,24 +290,25 @@ Streaming works with `"stream": true`, which returns OpenAI-format SSE regardles
 
 | Suite | Count | What it covers |
 |---|---:|---|
-| Go unit + integration (`go test -race ./...`) | **106 passed, 0 failed, 0 skipped, 0 data races** | JWT HS256/RS256/JWKS and `alg` confusion; layered key store; Lua dual bucket against **real Redis** (exact admission under 300 concurrent goroutines, TPM atomicity, refill, fallback and recovery); PII and injection tables with false-positive cases, a streaming redactor at multiple chunk sizes, and a **p99 latency budget test**; embedder separability; **live pgvector HNSW** search; breaker state machine (stale tickets, fast-failure reordering); every provider wire format over HTTP; 5xx/timeout/open-circuit failover; full-pipeline gateway tests (cache tiers, coalescing, 429s, PII, output redaction, SSE, CORS, telemetry); startup dependency retry; config and Kubernetes ConfigMap validation |
+| Go unit + integration (`go test -race ./...`) | **118 passed (84 test functions), 0 failed, 0 skipped, 0 data races** | JWT HS256/RS256/JWKS and `alg` confusion; layered key store; Lua dual bucket against **real Redis** (exact admission under 300 concurrent goroutines, TPM atomicity, refill, fallback and recovery); PII and injection tables with false-positive cases, a streaming redactor at multiple chunk sizes, and a **p99 latency budget test**; embedder separability; **live pgvector HNSW** search; breaker state machine (stale tickets, fast-failure reordering); every provider wire format over HTTP; 5xx/timeout/open-circuit failover; full-pipeline gateway tests (cache tiers, coalescing, 429s, PII, output redaction, SSE, CORS, telemetry); startup dependency retry; Ollama and fallback embedders, embedder separation, mixed-dimension pgvector, schema migration and upgrade, `extra_body`, injected faults, `/v1/embeddings`; config and Kubernetes ConfigMap validation |
+| Live local models (`make ollama-check`) | **9 passed** | Through real Ollama with `configs/gateway.yaml`: chat, streaming, embeddings, neural semantic cache hit and near-miss, 503 and timeout failover to Gemma, breaker trip and recovery, embedder-offline fallback (see "Local models with Ollama"). Runs locally; CI has no Ollama. |
 | Jest (`web/__tests__`) | **27 passed** | formatting utilities, playground request planning, SSE parsing, KPI / provider-matrix / audit-table / playground components |
 | Playwright (`web/e2e/dashboard.spec.ts`) | **4 passed** (+1 live) | dashboard rendering, SSE→polling fallback, playground toggles (semantic cache, PII, failover, injection), offline banner. The `E2E_LIVE=1` spec drives the real gateway (miss → semantic hit, redaction, failover) and passed against the running stack. |
 | `npm run build` | ✓ | zero TypeScript or build errors |
-| Docker Compose end-to-end (`scripts/compose-smoke.sh`) | **22 passed** | Full containerized stack (gateway, MockLLM, pgvector, Redis, Prometheus, web UI): auth/401, MISS → HIT-EXACT → HIT-SEMANTIC from containerized pgvector, PII REDACT and BLOCK, injection block, chaos failover, SSE translation, 429 + `Retry-After`, rows in `semantic_cache` / `guardrail_audit`, HNSW index, `/metrics`, telemetry SSE, Prometheus scraping (`up=1`), dashboard + CORS. The live Playwright spec also passes against the dashboard container. Runs in CI on every push. |
+| Docker Compose end-to-end (`scripts/compose-smoke.sh`) | **22 passed** | Full containerized stack (gateway, MockLLM, pgvector, Redis, Prometheus, web UI): auth/401, MISS → HIT-EXACT → HIT-SEMANTIC from containerized pgvector, PII REDACT and BLOCK, injection block, chaos failover, SSE translation, 429 + `Retry-After`, rows in `semantic_cache` / `guardrail_audit`, per-dimension HNSW indexes, `/metrics`, telemetry SSE, Prometheus scraping (`up=1`), dashboard + CORS. The live Playwright spec also passes against the dashboard container. Runs in CI on every push. |
 | Kubernetes end-to-end (`scripts/k8s-smoke.sh`) | **19 passed** | The production manifests plus a local overlay on a real cluster (k3s locally, kind in CI) with ingress-nginx and metrics-server: 3/3 replicas ready as non-root UID 65532 with a read-only root FS; all 19 functional checks routed through the **Ingress** and load-balanced across all 3 replicas (shared Redis/pgvector cache); metrics aggregated across pods; HPA reading live CPU; PDB allowing exactly 1 disruption; **a pod deleted under load → 291 requests, 0 failures**; **rolling restart of all replicas → 590 requests, 0 failures**; Redis outage → requests keep succeeding on the local fallback, then return to Redis automatically. Runs in CI on every push. |
 
 ---
 
 ## Observability
 
-- **`/metrics`** (Prometheus): `llmgateway_requests_total{model,cache,code}`, `llmgateway_gateway_overhead_seconds`, `llmgateway_upstream_latency_seconds{provider}`, `llmgateway_cache_lookups_total{result}`, `llmgateway_cache_similarity`, `llmgateway_tokens_saved_total`, `llmgateway_cost_saved_usd_total`, **`llmgateway_guardrail_triggers_total{type,action}`**, `llmgateway_ratelimit_rejections_total{reason}`, `llmgateway_circuit_breaker_state{provider}`, `llmgateway_provider_failovers_total{from,to}`, and more.
+- **`/metrics`** (Prometheus): `llmgateway_requests_total{model,cache,code}`, `llmgateway_gateway_overhead_seconds`, `llmgateway_upstream_latency_seconds{provider}`, `llmgateway_cache_lookups_total{result}`, `llmgateway_cache_similarity`, `llmgateway_tokens_saved_total`, `llmgateway_cost_saved_usd_total`, **`llmgateway_guardrail_triggers_total{type,action}`**, `llmgateway_ratelimit_rejections_total{reason}`, `llmgateway_circuit_breaker_state{provider}`, `llmgateway_provider_failovers_total{from,to}`, `llmgateway_embedder_fallbacks_total`, and more.
 - **`/v1/telemetry/summary`** and **`/v1/telemetry/stream`** (SSE, 1 s): totals, RPS, p50/p95/p99 overhead vs. upstream, exact/semantic/miss counts, USD saved, guardrail counts by category, breaker state and latency per provider, and the 50 most recent request traces.
 - **Audit:** one structured JSON line per request and guardrail event. Guardrail events are also batch-`COPY`'d into the `guardrail_audit` table.
 
 ## Configuration
 
-`configs/gateway.yaml` is the documented default, and every value can be overridden with environment variables (`LLMGW_REDIS_ADDR`, `LLMGW_POSTGRES_DSN`, `LLMGW_JWT_SECRET`, `LLMGW_JWKS_URL`, `LLMGW_CORS_ORIGINS`, `LLMGW_MOCKLLM_URL`, …). `server.dependency_wait` (default 30s) sets how long the gateway retries Redis and PostgreSQL at startup before falling back to in-memory mode, since containers can start in any order. The production Kubernetes ConfigMap disables the dev token endpoint and chaos headers, and a test enforces this.
+`configs/gateway.yaml` (local Ollama, the default) and `configs/gateway.mock.yaml` (bundled mock upstream) are both documented inline, and every value can be overridden with environment variables (`LLMGW_CONFIG`, `LLMGW_OLLAMA_URL`, `LLMGW_REDIS_ADDR`, `LLMGW_POSTGRES_DSN`, `LLMGW_JWT_SECRET`, `LLMGW_JWKS_URL`, `LLMGW_CORS_ORIGINS`, `LLMGW_MOCKLLM_URL`, …). `.env.example` lists them; the Makefile loads `.env` if present. `server.dependency_wait` (default 30s) sets how long the gateway retries Redis and PostgreSQL at startup before falling back to in-memory mode, since containers can start in any order. The production Kubernetes ConfigMap disables the dev token endpoint and chaos headers, and a test enforces this.
 
 ## Deployment
 
@@ -286,7 +337,10 @@ internal/router                 provider adapters, SSE parsing, circuit breaker,
 internal/telemetry              Prometheus metrics, rolling collector, SSE stream, audit logger
 internal/gateway                request pipeline + dependency wiring
 internal/{config,storage,mockllm}
-migrations/001_init_pgvector.sql pgvector schema, HNSW index, tenants, API keys, guardrail audit
+migrations/                     001 schema (tenants, API keys, semantic cache, guardrail audit); 002 multi-embedder upgrade
+configs/gateway.yaml            default config: local Ollama (qwen3.5:9b → gemma4:e4b, nomic-embed-text)
+configs/gateway.mock.yaml       mock-upstream config (compose, CI, Kubernetes overlay)
+.env.example                    environment overrides (no paid API keys required)
 web/                            Next.js 16 + React 19 + Tailwind 4 control plane, Jest + Playwright
 deploy/k8s/{base,overlays/local} Kubernetes manifests (production base + local-cluster overlay)
 deploy/prometheus/              Prometheus scrape config
@@ -301,7 +355,8 @@ scripts/runtime.sh              macOS: install/start/remove Colima + Docker (+ k
 ## Limitations
 
 - The benchmark runs on a single machine against a mock upstream. Absolute RPS is bounded by the mock's ~168 ms latency × 100 workers on misses, and by shared CPU on hits. Treat the numbers as relative, not production capacity.
-- The hashing embedder measures lexical similarity. Deep paraphrases need the pluggable HTTP embedder.
+- The headline benchmark isolates the gateway (mock upstream, hashing embedder). With local models, throughput is bounded by Ollama inference on one machine; `make ollama-check` verifies behavior and single-request latency, not load.
+- The hashing fallback embedder measures lexical similarity only; the default `nomic-embed-text` embedder handles deeper paraphrases.
 - pgvector 0.6's HNSW applies `WHERE` filters after the index scan. For very large multi-tenant tables, use partial indexes per large tenant, or pgvector ≥ 0.8 iterative scans.
 - Kubernetes is verified on single-node clusters (k3s and kind), not on a managed multi-node cloud cluster. Zone spreading and autoscaling *under real load* therefore aren't exercised; the HPA reading metrics and the PDB budget are.
 - Dashboard telemetry (`/v1/telemetry/*`) is per replica: behind a load balancer, each dashboard connection shows the replica it reached. Prometheus, which scrapes every pod, is the source of fleet-wide totals.

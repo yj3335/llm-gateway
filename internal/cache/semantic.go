@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 )
@@ -24,31 +25,74 @@ type SemanticStore interface {
 // ErrNotFound is returned by Search when no entry clears the threshold.
 var ErrNotFound = errors.New("cache: not found")
 
-// PGVectorStore stores embeddings in PostgreSQL and searches with the
-// pgvector HNSW index on cosine distance.
+// PGVectorStore stores embeddings in PostgreSQL and searches with pgvector
+// HNSW indexes on cosine distance. The embedding column is dimensionless so
+// several embedders can share the table (e.g. 768-d nomic-embed-text and the
+// 384-d hashing fallback). Each dimension gets a partial expression index,
+// the pattern pgvector documents for mixed dimensions:
+//
+//	CREATE INDEX ... USING hnsw ((embedding::vector(768)) vector_cosine_ops) WHERE dims = 768
+//
+// Queries cast with the same literal dimension so the planner can use it.
 type PGVectorStore struct {
 	Pool *pgxpool.Pool
+
+	indexed sync.Map // dims -> struct{}
 }
 
 func (s *PGVectorStore) Name() string { return "pgvector" }
 
-const searchSQL = `
-SELECT id, response_payload, model, 1 - (embedding <=> $1) AS similarity
+func searchSQL(dims int) string {
+	return fmt.Sprintf(`
+SELECT id, response_payload, model, 1 - (embedding::vector(%[1]d) <=> $1::vector(%[1]d)) AS similarity
 FROM semantic_cache
-WHERE tenant_id = $2 AND model = $4 AND scope_hash = $5 AND expires_at > now()
-  AND 1 - (embedding <=> $1) >= $3
-ORDER BY embedding <=> $1
-LIMIT 1`
+WHERE tenant_id = $2 AND model = $4 AND scope_hash = $5 AND embedder = $6 AND dims = %[1]d
+  AND expires_at > now()
+  AND 1 - (embedding::vector(%[1]d) <=> $1::vector(%[1]d)) >= $3
+ORDER BY embedding::vector(%[1]d) <=> $1::vector(%[1]d)
+LIMIT 1`, dims)
+}
+
+func validDims(d int) error {
+	if d < 1 || d > MaxIndexedDims {
+		return fmt.Errorf("pgvector: unsupported embedding dimension %d (1..%d)", d, MaxIndexedDims)
+	}
+	return nil
+}
+
+// EnsureIndex creates the partial HNSW index for a dimension if missing.
+// Concurrent replicas may race; a duplicate-index error is treated as success.
+func (s *PGVectorStore) EnsureIndex(ctx context.Context, dims int) error {
+	if err := validDims(dims); err != nil {
+		return err
+	}
+	if _, ok := s.indexed.Load(dims); ok {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, fmt.Sprintf(`
+CREATE INDEX IF NOT EXISTS semantic_cache_hnsw_d%[1]d ON semantic_cache
+USING hnsw ((embedding::vector(%[1]d)) vector_cosine_ops) WITH (m = 16, ef_construction = 64)
+WHERE dims = %[1]d`, dims))
+	var pgErr *pgconn.PgError
+	if err != nil && !(errors.As(err, &pgErr) && (pgErr.Code == "42P07" || pgErr.Code == "23505")) {
+		return fmt.Errorf("pgvector: create index for %d dims: %w", dims, err)
+	}
+	s.indexed.Store(dims, struct{}{})
+	return nil
+}
 
 // Search implements SemanticStore.
 func (s *PGVectorStore) Search(ctx context.Context, k Key, threshold float64) (*Entry, float64, error) {
+	if err := validDims(k.Dims()); err != nil {
+		return nil, 0, err
+	}
 	var (
 		id      int64
 		payload []byte
 		model   string
 		sim     float64
 	)
-	err := s.Pool.QueryRow(ctx, searchSQL, pgvector.NewVector(k.Embedding), k.TenantID, threshold, k.Model, k.ScopeHash).
+	err := s.Pool.QueryRow(ctx, searchSQL(k.Dims()), pgvector.NewVector(k.Embedding), k.TenantID, threshold, k.Model, k.ScopeHash, k.Embedder).
 		Scan(&id, &payload, &model, &sim)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, 0, ErrNotFound
@@ -65,20 +109,23 @@ func (s *PGVectorStore) Search(ctx context.Context, k Key, threshold float64) (*
 }
 
 const upsertSQL = `
-INSERT INTO semantic_cache (tenant_id, model, scope_hash, prompt_hash, prompt_text, embedding,
+INSERT INTO semantic_cache (tenant_id, model, embedder, dims, scope_hash, prompt_hash, prompt_text, embedding,
   response_payload, prompt_tokens, completion_tokens, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now() + make_interval(secs => $10))
-ON CONFLICT (tenant_id, model, prompt_hash) DO UPDATE SET
-  response_payload = EXCLUDED.response_payload, embedding = EXCLUDED.embedding,
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now() + make_interval(secs => $12))
+ON CONFLICT (tenant_id, model, embedder, prompt_hash) DO UPDATE SET
+  response_payload = EXCLUDED.response_payload, embedding = EXCLUDED.embedding, dims = EXCLUDED.dims,
   scope_hash = EXCLUDED.scope_hash, expires_at = EXCLUDED.expires_at, created_at = now()`
 
 // Put implements SemanticStore.
 func (s *PGVectorStore) Put(ctx context.Context, k Key, e *Entry, ttl time.Duration) error {
+	if err := s.EnsureIndex(ctx, k.Dims()); err != nil {
+		return err
+	}
 	payload, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	_, err = s.Pool.Exec(ctx, upsertSQL, k.TenantID, k.Model, k.ScopeHash, k.ExactHash, truncate(k.PromptText, 4000),
+	_, err = s.Pool.Exec(ctx, upsertSQL, k.TenantID, k.Model, k.Embedder, k.Dims(), k.ScopeHash, k.ExactHash, truncate(k.PromptText, 4000),
 		pgvector.NewVector(k.Embedding), payload, e.PromptTokens, e.CompletionTokens, ttl.Seconds())
 	if err != nil {
 		return fmt.Errorf("pgvector upsert: %w", err)
@@ -142,7 +189,9 @@ func NewMemoryVectorStore() *MemoryVectorStore {
 
 func (m *MemoryVectorStore) Name() string { return "memory" }
 
-func scopeKey(k Key) string { return k.TenantID + "\x00" + k.Model + "\x00" + k.ScopeHash }
+func scopeKey(k Key) string {
+	return k.TenantID + "\x00" + k.Model + "\x00" + k.ScopeHash + "\x00" + k.Embedder
+}
 
 // Search implements SemanticStore.
 func (m *MemoryVectorStore) Search(_ context.Context, k Key, threshold float64) (*Entry, float64, error) {

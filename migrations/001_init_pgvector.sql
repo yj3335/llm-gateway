@@ -27,32 +27,33 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS api_keys_tenant_idx ON api_keys (tenant_id);
 
 -- Semantic cache (L2) -----------------------------------------------------------
--- 384-dim embeddings from the deterministic feature-hashing embedder (or an
--- external embedding API configured with dimensions=384).
+-- The embedding column is dimensionless so several embedders can share the
+-- table (e.g. 768-d nomic-embed-text via Ollama and the 384-d hashing
+-- fallback). Vectors are only compared within one embedder; each dimension
+-- gets a partial HNSW expression index (see 002_multi_embedder.sql and
+-- PGVectorStore.EnsureIndex).
 CREATE TABLE IF NOT EXISTS semantic_cache (
     id                BIGSERIAL   PRIMARY KEY,
     tenant_id         TEXT        NOT NULL,
     model             TEXT        NOT NULL,
+    embedder          TEXT        NOT NULL DEFAULT 'hashing-ngram-384',
+    dims              INTEGER     NOT NULL DEFAULT 384,
     -- Hash of system prompt + prior turns: a semantic match is only valid when
     -- the surrounding conversation context is identical.
     scope_hash        CHAR(64)    NOT NULL,
     prompt_hash       CHAR(64)    NOT NULL,
     prompt_text       TEXT        NOT NULL,
-    embedding         vector(384) NOT NULL,
+    embedding         vector      NOT NULL,
     response_payload  JSONB       NOT NULL,
     prompt_tokens     INTEGER     NOT NULL DEFAULT 0,
     completion_tokens INTEGER     NOT NULL DEFAULT 0,
     hit_count         BIGINT      NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at        TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '24 hours',
-    CONSTRAINT semantic_cache_unique UNIQUE (tenant_id, model, prompt_hash)
+    CONSTRAINT semantic_cache_embedder_unique UNIQUE (tenant_id, model, embedder, prompt_hash)
 );
-
--- HNSW approximate-nearest-neighbour index on cosine distance.
-CREATE INDEX IF NOT EXISTS semantic_cache_embedding_hnsw
-    ON semantic_cache USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-CREATE INDEX IF NOT EXISTS semantic_cache_scope_idx ON semantic_cache (tenant_id, model, scope_hash);
+-- Indexes on the embedder/dims columns are created in 002, which also
+-- upgrades databases created by the original single-dimension schema.
 CREATE INDEX IF NOT EXISTS semantic_cache_expires_idx ON semantic_cache (expires_at);
 
 -- Guardrail audit trail -----------------------------------------------------------

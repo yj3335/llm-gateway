@@ -54,7 +54,13 @@ type Key struct {
 	ScopeHash  string // sha256(model, normalized context excluding the final user turn)
 	PromptText string // final user turn: what gets embedded
 	Embedding  []float32
+	// Embedder names the model that produced Embedding; semantic matches are
+	// only valid between vectors from the same embedder.
+	Embedder string
 }
+
+// Dims returns the embedding dimensionality.
+func (k Key) Dims() int { return len(k.Embedding) }
 
 // BuildKey derives exact and scope hashes. Messages should already be
 // guardrail-redacted so PII never reaches the cache.
@@ -101,12 +107,16 @@ type Result struct {
 	Entry      *Entry
 	Similarity float64
 	Layer      string // memory | redis | pgvector | memory-vector
+	Embedder   string // embedder used for the semantic probe ("" if none ran)
 	Elapsed    time.Duration
 }
 
 // Options configures the cache.
 type Options struct {
+	// SimilarityThreshold is the default cosine threshold; Thresholds overrides
+	// it per embedder name (each embedder has its own similarity scale).
 	SimilarityThreshold float64
+	Thresholds          map[string]float64
 	TTL                 time.Duration
 	L1MaxEntries        int
 	WriteQueueSize      int
@@ -171,8 +181,33 @@ func New(o Options, emb Embedder, sem SemanticStore, rdb redis.UniversalClient) 
 	return c
 }
 
-// Threshold returns the configured semantic similarity threshold.
+// Threshold returns the default semantic similarity threshold.
 func (c *Cache) Threshold() float64 { return c.opts.SimilarityThreshold }
+
+// ThresholdFor returns the similarity threshold for an embedder.
+func (c *Cache) ThresholdFor(embedder string) float64 {
+	if t, ok := c.opts.Thresholds[embedder]; ok {
+		return t
+	}
+	return c.opts.SimilarityThreshold
+}
+
+// Embed embeds text with the configured embedder and reports which embedder
+// produced the vector (the fallback may have been used).
+func (c *Cache) Embed(ctx context.Context, text string) ([]float32, string, error) {
+	if c.embedder == nil {
+		return nil, "", errors.New("cache: no embedder configured")
+	}
+	return embedNamed(ctx, c.embedder, text)
+}
+
+// EmbedderName names the configured (primary) embedder.
+func (c *Cache) EmbedderName() string {
+	if c.embedder == nil {
+		return "none"
+	}
+	return c.embedder.Name()
+}
 
 // SemanticBackend names the L2 store ("none" if disabled).
 func (c *Cache) SemanticBackend() string {
@@ -218,26 +253,26 @@ func (c *Cache) Lookup(ctx context.Context, k *Key) Result {
 		return done(Result{Status: StatusMiss})
 	}
 	if k.Embedding == nil {
-		v, err := c.embedder.Embed(ctx, k.PromptText)
+		v, name, err := embedNamed(ctx, c.embedder, k.PromptText)
 		if err != nil {
 			c.report("embed", err)
 			return done(Result{Status: StatusMiss})
 		}
-		k.Embedding = v
+		k.Embedding, k.Embedder = v, name
 	}
-	e, sim, err := c.sem.Search(ctx, *k, c.opts.SimilarityThreshold)
+	e, sim, err := c.sem.Search(ctx, *k, c.ThresholdFor(k.Embedder))
 	if err != nil {
 		if !errors.Is(err, ErrNotFound) {
 			c.report("semantic_search", err)
 		}
-		return done(Result{Status: StatusMiss})
+		return done(Result{Status: StatusMiss, Embedder: k.Embedder})
 	}
 	if e.cacheID > 0 {
 		c.hitMu.Lock()
 		c.hits[e.cacheID]++
 		c.hitMu.Unlock()
 	}
-	return done(Result{Status: StatusHitSemantic, Entry: e, Similarity: sim, Layer: c.sem.Name()})
+	return done(Result{Status: StatusHitSemantic, Entry: e, Similarity: sim, Layer: c.sem.Name(), Embedder: k.Embedder})
 }
 
 // Store writes e into L1 memory synchronously and to Redis + L2 asynchronously.
@@ -312,12 +347,12 @@ func (c *Cache) write(ctx context.Context, j writeJob) {
 	}
 	if c.sem != nil && c.embedder != nil && j.key.PromptText != "" {
 		if j.key.Embedding == nil {
-			v, err := c.embedder.Embed(ctx, j.key.PromptText)
+			v, name, err := embedNamed(ctx, c.embedder, j.key.PromptText)
 			if err != nil {
 				c.report("embed", err)
 				return
 			}
-			j.key.Embedding = v
+			j.key.Embedding, j.key.Embedder = v, name
 		}
 		c.report("semantic_put", c.sem.Put(ctx, j.key, j.entry, c.opts.TTL))
 	}

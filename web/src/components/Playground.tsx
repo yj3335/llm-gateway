@@ -22,7 +22,9 @@ export interface PlaygroundResult {
   error?: string;
 }
 
-const MODELS = ["gpt-4o-mini", "claude-3-5-haiku-latest", "gemini-2.0-flash", "llama3.1"];
+// Local Ollama models first (configs/gateway.yaml); the others route through the
+// mock upstream (configs/gateway.mock.yaml) or map to the default local route.
+const MODELS = ["qwen3.5:9b", "gemma4:e4b", "gpt-4o-mini", "claude-3-5-haiku-latest", "gemini-2.0-flash"];
 
 const TOGGLES: { key: keyof PlaygroundOptions; label: string; hint: string }[] = [
   { key: "semanticCache", label: "Test Semantic Cache (send paraphrased prompt)", hint: "primes the cache, then sends a paraphrase" },

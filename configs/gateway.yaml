@@ -1,13 +1,19 @@
-# LLM Gateway configuration (local development against cmd/mockllm).
+# LLM Gateway configuration: local Ollama models, zero paid API keys.
+#   ollama pull qwen3.5:9b && ollama pull gemma4:e4b && ollama pull nomic-embed-text
+#   make run            # gateway on :8080 using this file
+#   make ollama-check   # live integration test through Ollama
 # Every value can be overridden via LLMGW_* environment variables (see internal/config).
+# LLMGW_OLLAMA_URL rewrites http://localhost:11434 below (e.g. when the gateway
+# runs in a container: http://host.docker.internal:11434).
+# The mock-upstream configuration lives in configs/gateway.mock.yaml.
 server:
   addr: ":8080"
   read_timeout: 30s
-  write_timeout: 120s
+  write_timeout: 300s               # local generation can take a while
   max_body_bytes: 1048576
   cors_origins: ["http://localhost:3000", "http://127.0.0.1:3000"]
-  enable_chaos_headers: true        # playground/bench fault injection; disable in production
-  dependency_wait: 30s              # retry Redis/Postgres at startup before falling back to memory
+  enable_chaos_headers: true        # X-Gateway-Chaos: fail-primary | timeout-primary (disable in production)
+  dependency_wait: 30s
 
 auth:
   jwt_hmac_secret: "dev-insecure-change-me"
@@ -29,7 +35,7 @@ redis:
 postgres:
   dsn: "postgres://llmgw@localhost:5432/llmgateway?sslmode=disable"
   max_conns: 64
-  min_conns: 32                     # pre-warmed so bursts never pay connection setup
+  min_conns: 32
   run_migrations: true
   hnsw_ef_search: 40
 
@@ -44,76 +50,61 @@ guardrails:
 
 cache:
   enabled: true
-  similarity_threshold: 0.86
+  # Deep neural embeddings from Ollama (nomic-embed-text, 768 dimensions).
+  # If Ollama is unreachable the gateway falls back to the deterministic
+  # hashing embedder; entries from different embedders are never compared.
+  embedder: ollama
+  embedding_url: "http://localhost:11434/api/embeddings"
+  embedding_model: nomic-embed-text
+  embedding_dimensions: 0           # 0 = native 768; smaller values truncate (Matryoshka)
+  embedding_prefix: ""              # no task prefix: best paraphrase/near-miss separation for this cache
+  embedding_timeout: 2s
+  # Calibrated on paraphrase vs near-miss pairs: nomic paraphrases scored >= 0.948,
+  # different questions <= 0.890 (e.g. "TCP congestion control" vs "TCP flow control").
+  similarity_threshold: 0.92
+  fallback_similarity_threshold: 0.86   # hashing embedder (fallback) scale
   ttl: 24h
   l1_max_entries: 50000
-  embedder: hashing                 # "hashing" (local, deterministic) | "openai" (external API)
-  embedding_url: "http://localhost:8090/v1/embeddings"
-  embedding_model: "text-embedding-3-small"
-  embedding_api_key_env: OPENAI_API_KEY
   write_queue_size: 8192
   write_workers: 8
 
-# All providers point at the bundled mock upstream; swap base_url/api_key_env
-# for real endpoints (https://api.openai.com, https://api.anthropic.com,
-# https://generativelanguage.googleapis.com, http://ollama:11434).
+# Both providers are the same local Ollama server running different models.
+# reasoning_effort: none disables "thinking" output: with it enabled, Qwen 3.5 and
+# Gemma 4 spend the whole max_tokens budget reasoning and return empty content.
 providers:
-  - name: openai
-    type: openai
-    base_url: "http://localhost:8090"
-    api_key_env: OPENAI_API_KEY
-    timeout: 30s
-    default_model: gpt-4o-mini
-  - name: anthropic
-    type: anthropic
-    base_url: "http://localhost:8090"
-    api_key_env: ANTHROPIC_API_KEY
-    timeout: 30s
-    default_model: claude-3-5-haiku-latest
-  - name: gemini
-    type: gemini
-    base_url: "http://localhost:8090"
-    api_key_env: GEMINI_API_KEY
-    timeout: 30s
-    default_model: gemini-2.0-flash
-  - name: ollama
+  - name: ollama-qwen
     type: ollama
-    base_url: "http://localhost:8090"
-    timeout: 60s
-    default_model: llama3.1
+    base_url: "http://localhost:11434"
+    timeout: 120s
+    default_model: "qwen3.5:9b"
+    extra_body: { reasoning_effort: none }
+  - name: ollama-gemma
+    type: ollama
+    base_url: "http://localhost:11434"
+    timeout: 120s
+    default_model: "gemma4:e4b"       # or gemma4:12b for higher quality (needs more memory)
+    extra_body: { reasoning_effort: none }
 
 routes:
-  - match: "gpt-*"
+  # Ask for a Gemma model explicitly: Gemma first, Qwen as fallback.
+  - match: "gemma*"
     targets:
-      - { provider: openai }
-      - { provider: anthropic, model: claude-3-5-haiku-latest }
-      - { provider: gemini, model: gemini-2.0-flash }
-  - match: "claude-*"
-    targets:
-      - { provider: anthropic }
-      - { provider: openai, model: gpt-4o-mini }
-  - match: "gemini-*"
-    targets:
-      - { provider: gemini }
-      - { provider: openai, model: gpt-4o-mini }
-  - match: "llama*"
-    targets:
-      - { provider: ollama }
-      - { provider: openai, model: gpt-4o-mini }
+      - { provider: ollama-gemma }
+      - { provider: ollama-qwen, model: "qwen3.5:9b" }
+  # Everything else (including OpenAI-style model names from existing clients):
+  # Qwen 3.5 9B primary, Gemma 4 E4B fallback.
   - match: "*"
     targets:
-      - { provider: openai }
-      - { provider: anthropic, model: claude-3-5-haiku-latest }
+      - { provider: ollama-qwen, model: "qwen3.5:9b" }
+      - { provider: ollama-gemma, model: "gemma4:e4b" }
 
 circuit_breaker:
   # Trip when >= 50% of the last 20 completed calls failed (min 10 calls).
-  # Rate-based tripping avoids false opens when fast 5xx responses race
-  # ahead of slow successes under high concurrency.
   failure_rate_window: 20
   min_requests: 10
-  failure_threshold: 0              # optional consecutive-failure rule (0 = off)
   failure_rate: 0.5
-  open_timeout: 5s
+  failure_threshold: 0
+  open_timeout: 10s
   half_open_max_requests: 2
   half_open_successes: 2
 
@@ -121,12 +112,11 @@ telemetry:
   stream_interval: 1s
   sample_window: 10000
 
-pricing:                            # USD per 1K tokens, used for "cost saved"
-  default:        { input: 0.0025,  output: 0.01 }
-  "gpt-4o-mini":  { input: 0.00015, output: 0.0006 }
-  "gpt-4o":       { input: 0.0025,  output: 0.01 }
-  "claude-*":     { input: 0.0008,  output: 0.004 }
-  "gemini-*":     { input: 0.0001,  output: 0.0004 }
+# Local inference costs nothing. These are reference prices (USD per 1K tokens)
+# of a comparable hosted model, so "cost saved" estimates the spend a cache hit
+# would avoid on a paid API.
+pricing:
+  default: { input: 0.00015, output: 0.0006 }
 
 tenants:
   - tenant_id: demo

@@ -92,8 +92,9 @@ if $PSQL -tAc "SELECT 1" >/dev/null 2>&1; then
   check "semantic_cache rows written to pgvector ($rows)" '[ "${rows:-0}" -ge 1 ]'
   audit=$($PSQL -tAc "SELECT count(*) FROM guardrail_audit" 2>/dev/null | tr -d '[:space:]')
   check "guardrail_audit rows persisted ($audit)" '[ "${audit:-0}" -ge 1 ]'
-  idx=$($PSQL -tAc "SELECT count(*) FROM pg_indexes WHERE indexname='semantic_cache_embedding_hnsw'" 2>/dev/null | tr -d '[:space:]')
-  check "HNSW index exists" '[ "$idx" = 1 ]'
+  # One partial HNSW index per embedding dimension (384 = hashing, 768 = nomic-embed-text).
+  idx=$($PSQL -tAc "SELECT count(*) FROM pg_indexes WHERE indexname IN ('semantic_cache_hnsw_d384','semantic_cache_hnsw_d768')" 2>/dev/null | tr -d '[:space:]')
+  check "per-dimension HNSW indexes exist (384 + 768)" '[ "$idx" = 2 ]'
 else
   bad "cannot reach Postgres with: $PSQL"
 fi

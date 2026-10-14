@@ -31,6 +31,7 @@ type Metrics struct {
 	BreakerTransitions *prometheus.CounterVec
 	Failovers          *prometheus.CounterVec
 	TokensProcessed    *prometheus.CounterVec
+	EmbedderFallbacks  prometheus.Counter
 }
 
 var latencyBuckets = []float64{.0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
@@ -100,6 +101,9 @@ func NewMetrics() *Metrics {
 	m.TokensProcessed = f(prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "llmgateway_tokens_total", Help: "Tokens processed upstream by provider and kind.",
 	}, []string{"provider", "kind"})).(*prometheus.CounterVec)
+	m.EmbedderFallbacks = f(prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "llmgateway_embedder_fallbacks_total", Help: "Embeddings served by the hashing fallback because the primary embedder was unavailable.",
+	})).(prometheus.Counter)
 	return m
 }
 

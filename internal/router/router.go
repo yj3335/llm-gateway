@@ -57,9 +57,27 @@ type Outcome struct {
 
 // Chaos requests synthetic upstream failures (dev/benchmark only).
 type Chaos struct {
-	// FailPrimary makes the first target return HTTP 503 by forwarding
-	// X-Mock-Fail: 503 (honoured by cmd/mockllm).
+	// FailPrimary makes the first target fail with HTTP 503.
 	FailPrimary bool
+	// TimeoutPrimary makes the first target fail with an upstream timeout.
+	TimeoutPrimary bool
+}
+
+// injectedFault synthesizes the requested failure for the primary target
+// inside the gateway, so chaos drills work against any upstream (real
+// providers and local Ollama ignore test headers). The failure flows through
+// the normal path: it is recorded by the circuit breaker and triggers failover.
+func injectedFault(i int, provider string, chaos Chaos) error {
+	if i != 0 {
+		return nil
+	}
+	switch {
+	case chaos.FailPrimary:
+		return &UpstreamError{Provider: provider, Status: http.StatusServiceUnavailable, Body: "fault injected by X-Gateway-Chaos: fail-primary"}
+	case chaos.TimeoutPrimary:
+		return &UpstreamError{Provider: provider, Timeout: true, Err: errors.New("timeout injected by X-Gateway-Chaos: timeout-primary")}
+	}
+	return nil
 }
 
 // Router dispatches requests to providers with circuit breaking and failover.
@@ -157,18 +175,6 @@ func (r *Router) prepare(t Target, req *ChatRequest) *ChatRequest {
 	return &cp
 }
 
-func (r *Router) opts(i int, base CallOptions, chaos Chaos) CallOptions {
-	if i == 0 && chaos.FailPrimary {
-		h := base.Headers.Clone()
-		if h == nil {
-			h = http.Header{}
-		}
-		h.Set("X-Mock-Fail", "503")
-		return CallOptions{Headers: h}
-	}
-	return base
-}
-
 // Complete performs a non-streaming completion with failover.
 func (r *Router) Complete(ctx context.Context, req *ChatRequest, base CallOptions, chaos Chaos) (*Completion, Outcome, error) {
 	targets, err := r.Resolve(req.Model)
@@ -192,7 +198,11 @@ func (r *Router) Complete(ctx context.Context, req *ChatRequest, base CallOption
 		}
 		preq := r.prepare(t, req)
 		start := time.Now()
-		c, cerr := p.Complete(ctx, preq, r.opts(i, base, chaos))
+		var c *Completion
+		cerr := injectedFault(i, t.Provider, chaos)
+		if cerr == nil {
+			c, cerr = p.Complete(ctx, preq, base)
+		}
 		lat := time.Since(start)
 		if cerr == nil {
 			br.Done(ticket, true)
@@ -243,7 +253,11 @@ func (r *Router) Stream(ctx context.Context, req *ChatRequest, base CallOptions,
 		}
 		preq := r.prepare(t, req)
 		start := time.Now()
-		s, serr := p.Stream(ctx, preq, r.opts(i, base, chaos))
+		var s Stream
+		serr := injectedFault(i, t.Provider, chaos)
+		if serr == nil {
+			s, serr = p.Stream(ctx, preq, base)
+		}
 		lat := time.Since(start)
 		if serr == nil {
 			out.Attempts = append(out.Attempts, Attempt{Provider: t.Provider, Model: preq.Model, Status: 200, Latency: lat})

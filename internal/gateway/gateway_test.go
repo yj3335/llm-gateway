@@ -183,7 +183,8 @@ func TestCacheFlow(t *testing.T) {
 	h := newHarness(t)
 	tok := bearer(h.token("cache-tenant", 1000))
 	r1 := h.post(tok, chatBody("gpt-4o-mini", "Explain how Kafka consumer groups work in simple terms.", false))
-	if r1.status != 200 || r1.header.Get("X-Gateway-Cache") != "MISS" || r1.header.Get("X-Gateway-Provider") != "openai" {
+	if r1.status != 200 || r1.header.Get("X-Gateway-Cache") != "MISS" || r1.header.Get("X-Gateway-Provider") != "openai" ||
+		r1.header.Get("X-Gateway-Upstream-Model") == "" || r1.header.Get("X-Gateway-Attempts") != "1" {
 		t.Fatalf("miss: %d %v %s", r1.status, r1.header, r1.body)
 	}
 	if r1.header.Get("X-Gateway-Upstream-Latency-Ms") == "" || r1.header.Get("X-RateLimit-Remaining-Requests") == "" {
@@ -476,5 +477,61 @@ func TestWaitForRetriesUntilDependencyIsUp(t *testing.T) {
 	err = waitFor(context.Background(), 0, slog.New(slog.NewTextHandler(io.Discard, nil)), "dep", func(context.Context) error { calls++; return fmt.Errorf("down") })
 	if err == nil || calls != 1 {
 		t.Fatalf("zero wait must try once and fail: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestTimeoutChaosAndEmbedderHeader(t *testing.T) {
+	h := newHarness(t)
+	hdr := bearer(h.token("chaos-timeout", 1000))
+	hdr["X-Gateway-Chaos"] = "timeout-primary"
+	r := h.post(hdr, chatBody("gpt-4o-mini", "What is a vector clock?", false))
+	if r.status != 200 || r.header.Get("X-Gateway-Provider") != "anthropic" || r.header.Get("X-Gateway-Provider-Failover") != "true" {
+		t.Fatalf("timeout chaos failover: %d %v", r.status, r.header)
+	}
+	r = h.post(bearer(h.token("emb", 1000)), chatBody("gpt-4o-mini", "Explain consistent hashing.", false))
+	if r.header.Get("X-Gateway-Embedder") != "hashing-ngram-384" {
+		t.Fatalf("missing X-Gateway-Embedder header: %v", r.header)
+	}
+}
+
+func TestEmbeddingsEndpoint(t *testing.T) {
+	h := newHarness(t)
+	tok := bearer(h.token("emb-api", 1000))
+	req := func(hdr map[string]string, body string) result {
+		t.Helper()
+		rq, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/v1/embeddings", strings.NewReader(body))
+		for k, v := range hdr {
+			rq.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(rq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return result{resp.StatusCode, resp.Header, b}
+	}
+	if got := req(nil, `{"input":"hello"}`); got.status != http.StatusUnauthorized {
+		t.Fatalf("embeddings must require auth, got %d", got.status)
+	}
+	got := req(tok, `{"input":["What is the CAP theorem?","Explain the CAP theorem"]}`)
+	if got.status != 200 || got.header.Get("X-Gateway-Embedder") != "hashing-ngram-384" {
+		t.Fatalf("embeddings: %d %v %s", got.status, got.header, got.body)
+	}
+	var out struct {
+		Model string `json:"model"`
+		Data  []struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(got.body, &out); err != nil || len(out.Data) != 2 || len(out.Data[1].Embedding) != 384 || out.Data[1].Index != 1 || out.Model != "hashing-ngram-384" {
+		t.Fatalf("bad embeddings response: %+v %v", out, err)
+	}
+	if got := req(tok, `{"input":[]}`); got.status != 400 {
+		t.Fatalf("empty input must be rejected, got %d", got.status)
+	}
+	if got := req(tok, `{"input":42}`); got.status != 400 {
+		t.Fatalf("non-string input must be rejected, got %d", got.status)
 	}
 }

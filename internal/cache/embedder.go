@@ -14,19 +14,39 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"math"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// Dim is the embedding dimensionality stored in pgvector (vector(384)).
+// Dim is the dimensionality of the built-in hashing embedder.
 const Dim = 384
+
+// MaxIndexedDims is pgvector's HNSW limit for the vector type.
+const MaxIndexedDims = 2000
 
 // Embedder turns text into a unit-length vector.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 	Name() string
+}
+
+// NamedEmbedder reports which embedder actually produced a vector. A
+// FallbackEmbedder can switch between models, and vectors from different
+// models are not comparable, so the cache scopes entries by this name.
+type NamedEmbedder interface {
+	EmbedNamed(ctx context.Context, text string) ([]float32, string, error)
+}
+
+func embedNamed(ctx context.Context, e Embedder, text string) ([]float32, string, error) {
+	if ne, ok := e.(NamedEmbedder); ok {
+		return ne.EmbedNamed(ctx, text)
+	}
+	v, err := e.Embed(ctx, text)
+	return v, e.Name(), err
 }
 
 // HashingEmbedder is a deterministic, dependency-free embedder using signed
@@ -119,19 +139,27 @@ type HTTPEmbedder struct {
 	URL    string // e.g. https://api.openai.com/v1/embeddings
 	Model  string
 	APIKey string
+	Dims   int // requested dimensions (default Dim)
 	Client *http.Client
 }
 
 // NewHTTPEmbedder returns an embedder for an OpenAI-compatible API.
 func NewHTTPEmbedder(url, model, apiKey string) *HTTPEmbedder {
-	return &HTTPEmbedder{URL: url, Model: model, APIKey: apiKey, Client: &http.Client{Timeout: 5 * time.Second}}
+	return &HTTPEmbedder{URL: url, Model: model, APIKey: apiKey, Dims: Dim, Client: &http.Client{Timeout: 5 * time.Second}}
 }
 
-func (e *HTTPEmbedder) Name() string { return "http:" + e.Model }
+func (e *HTTPEmbedder) Name() string { return fmt.Sprintf("http:%s:%d", e.Model, e.dims()) }
+
+func (e *HTTPEmbedder) dims() int {
+	if e.Dims > 0 {
+		return e.Dims
+	}
+	return Dim
+}
 
 // Embed implements Embedder.
 func (e *HTTPEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	body, _ := json.Marshal(map[string]any{"input": text, "model": e.Model, "dimensions": Dim})
+	body, _ := json.Marshal(map[string]any{"input": text, "model": e.Model, "dimensions": e.dims()})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.URL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -160,11 +188,134 @@ func (e *HTTPEmbedder) Embed(ctx context.Context, text string) ([]float32, error
 		return nil, errors.New("embedding response has no data")
 	}
 	v := out.Data[0].Embedding
-	if len(v) != Dim {
-		return nil, fmt.Errorf("embedding has %d dims, want %d", len(v), Dim)
+	if len(v) != e.dims() {
+		return nil, fmt.Errorf("embedding has %d dims, want %d", len(v), e.dims())
 	}
 	normalizeInPlace(v)
 	return v, nil
+}
+
+// OllamaEmbedder calls Ollama's /api/embeddings endpoint (for example with
+// nomic-embed-text, 768 dimensions). Ollama returns unnormalized vectors, so
+// they are L2-normalized here. If Dims is set below the model's native size,
+// vectors are truncated first: valid for Matryoshka-trained models such as
+// nomic-embed-text v1.5.
+type OllamaEmbedder struct {
+	URL    string // e.g. http://localhost:11434/api/embeddings
+	Model  string
+	Prefix string // optional task prefix prepended to each text
+	Dims   int    // 0 = native size
+	Client *http.Client
+}
+
+// NewOllamaEmbedder returns an embedder for a local Ollama server.
+func NewOllamaEmbedder(url, model string, dims int, prefix string, timeout time.Duration) *OllamaEmbedder {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	return &OllamaEmbedder{URL: url, Model: model, Prefix: prefix, Dims: dims, Client: &http.Client{Timeout: timeout}}
+}
+
+// Name identifies the model (and truncation) so incompatible vectors are
+// never compared.
+func (e *OllamaEmbedder) Name() string {
+	if e.Dims > 0 {
+		return fmt.Sprintf("ollama:%s:%d", e.Model, e.Dims)
+	}
+	return "ollama:" + e.Model
+}
+
+// Embed implements Embedder.
+func (e *OllamaEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	body, _ := json.Marshal(map[string]any{"model": e.Model, "prompt": e.Prefix + text})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embedding request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("ollama embedding request: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var out struct {
+		Embedding []float32 `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("ollama embedding decode: %w", err)
+	}
+	v := out.Embedding
+	if len(v) == 0 {
+		return nil, errors.New("ollama returned an empty embedding (is the model an embedding model?)")
+	}
+	if e.Dims > 0 {
+		if e.Dims > len(v) {
+			return nil, fmt.Errorf("embedding_dimensions %d exceeds the model's %d dimensions", e.Dims, len(v))
+		}
+		v = v[:e.Dims]
+	}
+	if len(v) > MaxIndexedDims {
+		return nil, fmt.Errorf("embedding has %d dims; pgvector HNSW supports at most %d (set embedding_dimensions)", len(v), MaxIndexedDims)
+	}
+	normalizeInPlace(v)
+	return v, nil
+}
+
+// FallbackEmbedder uses Primary (e.g. Ollama) and switches to Secondary
+// (the deterministic hashing embedder) when Primary fails, retrying Primary
+// after Backoff. The cache keeps each embedder's entries separate.
+type FallbackEmbedder struct {
+	Primary, Secondary Embedder
+	Backoff            time.Duration
+	// OnFallback (optional) observes each request served by Secondary;
+	// err is the Primary failure that triggered the switch (nil while backing off).
+	OnFallback func(err error)
+
+	downUntil atomic.Int64 // unix nanos
+}
+
+// NewFallbackEmbedder wraps primary with secondary as the fallback.
+func NewFallbackEmbedder(primary, secondary Embedder, backoff time.Duration) *FallbackEmbedder {
+	if backoff <= 0 {
+		backoff = 10 * time.Second
+	}
+	return &FallbackEmbedder{Primary: primary, Secondary: secondary, Backoff: backoff}
+}
+
+// Name reports the primary embedder.
+func (f *FallbackEmbedder) Name() string { return f.Primary.Name() }
+
+// Healthy reports whether the primary is currently in use.
+func (f *FallbackEmbedder) Healthy() bool { return time.Now().UnixNano() >= f.downUntil.Load() }
+
+// Embed implements Embedder.
+func (f *FallbackEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	v, _, err := f.EmbedNamed(ctx, text)
+	return v, err
+}
+
+// EmbedNamed implements NamedEmbedder.
+func (f *FallbackEmbedder) EmbedNamed(ctx context.Context, text string) ([]float32, string, error) {
+	if f.Healthy() {
+		v, name, err := embedNamed(ctx, f.Primary, text)
+		if err == nil {
+			return v, name, nil
+		}
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		f.downUntil.Store(time.Now().Add(f.Backoff).UnixNano())
+		if f.OnFallback != nil {
+			f.OnFallback(err)
+		}
+	} else if f.OnFallback != nil {
+		f.OnFallback(nil)
+	}
+	return embedNamed(ctx, f.Secondary, text)
 }
 
 func normalizeInPlace(v []float32) {

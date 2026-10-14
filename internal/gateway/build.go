@@ -179,11 +179,42 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 
 	// ---- Cache ----------------------------------------------------------------------------
 	var c *cache.Cache
+	var embedderHealthy func() bool
 	if cfg.Cache.Enabled {
-		var emb cache.Embedder = cache.NewHashingEmbedder()
-		if cfg.Cache.Embedder == "openai" || cfg.Cache.Embedder == "http" {
-			emb = cache.NewHTTPEmbedder(cfg.Cache.EmbeddingURL, cfg.Cache.EmbeddingModel, os.Getenv(cfg.Cache.EmbeddingAPIKeyEnv))
+		hashing := cache.NewHashingEmbedder()
+		var emb cache.Embedder = hashing
+		thresholds := map[string]float64{}
+		switch cfg.Cache.Embedder {
+		case "openai", "http":
+			he := cache.NewHTTPEmbedder(cfg.Cache.EmbeddingURL, cfg.Cache.EmbeddingModel, os.Getenv(cfg.Cache.EmbeddingAPIKeyEnv))
+			if cfg.Cache.EmbeddingDimensions > 0 {
+				he.Dims = cfg.Cache.EmbeddingDimensions
+			}
+			emb = he
+		case "ollama":
+			// Neural embeddings from local Ollama; deterministic hashing takes
+			// over while Ollama is unreachable. Each embedder has its own
+			// similarity scale, hence its own threshold.
+			oe := cache.NewOllamaEmbedder(cfg.Cache.EmbeddingURL, cfg.Cache.EmbeddingModel, cfg.Cache.EmbeddingDimensions, cfg.Cache.EmbeddingPrefix, cfg.Cache.EmbeddingTimeout)
+			fb := cache.NewFallbackEmbedder(oe, hashing, 10*time.Second)
+			fb.OnFallback = func(err error) {
+				metrics.EmbedderFallbacks.Inc()
+				if err != nil {
+					log.Warn("embedder unavailable; using hashing fallback", "embedder", oe.Name(), "err", err)
+				}
+			}
+			emb = fb
+			embedderHealthy = fb.Healthy
+			pctx, cancel := context.WithTimeout(ctx, 30*time.Second) // first call loads the model
+			if _, err := oe.Embed(pctx, "warm-up"); err != nil {
+				log.Warn("ollama embedder not reachable at startup; hashing fallback active until it is", "url", cfg.Cache.EmbeddingURL, "err", err)
+			}
+			cancel()
 		}
+		if cfg.Cache.FallbackSimilarityThreshold > 0 {
+			thresholds[hashing.Name()] = cfg.Cache.FallbackSimilarityThreshold
+		}
+		thresholds[emb.Name()] = cfg.Cache.SimilarityThreshold
 		var sem cache.SemanticStore = cache.NewMemoryVectorStore()
 		if pool != nil {
 			sem = &cache.PGVectorStore{Pool: pool}
@@ -193,7 +224,7 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 			exact = rdb
 		}
 		c = cache.New(cache.Options{
-			SimilarityThreshold: cfg.Cache.SimilarityThreshold, TTL: cfg.Cache.TTL, L1MaxEntries: cfg.Cache.L1MaxEntries,
+			SimilarityThreshold: cfg.Cache.SimilarityThreshold, Thresholds: thresholds, TTL: cfg.Cache.TTL, L1MaxEntries: cfg.Cache.L1MaxEntries,
 			WriteQueueSize: cfg.Cache.WriteQueueSize, WriteWorkers: cfg.Cache.WriteWorkers,
 		}, emb, sem, exact)
 		c.OnError = func(op string, err error) {
@@ -207,6 +238,9 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 		}
 		backends["cache_l2"] = sem.Name()
 		backends["embedder"] = emb.Name()
+		if emb != cache.Embedder(hashing) {
+			backends["embedder"] += " (fallback: " + hashing.Name() + ")"
+		}
 	}
 
 	// ---- Router ----------------------------------------------------------------------------
@@ -218,7 +252,7 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 	for _, pc := range cfg.Providers {
 		p, err := router.NewProviderFromEnv(router.ProviderSpec{
 			Name: pc.Name, Type: pc.Type, BaseURL: pc.BaseURL, Timeout: pc.Timeout,
-			DefaultModel: pc.DefaultModel, Query: pc.Query, Headers: pc.Headers,
+			DefaultModel: pc.DefaultModel, Query: pc.Query, Headers: pc.Headers, ExtraBody: pc.ExtraBody,
 		}, pc.APIKeyEnv, client)
 		if err != nil {
 			cleanup()
@@ -270,6 +304,13 @@ func Build(ctx context.Context, cfg config.Config, o BuildOptions) (*Gateway, fu
 				out["postgres"] = "degraded: " + err.Error()
 			} else {
 				out["postgres"] = "ok"
+			}
+		}
+		if embedderHealthy != nil {
+			if embedderHealthy() {
+				out["embedder"] = "ok"
+			} else {
+				out["embedder"] = "degraded: hashing fallback in use"
 			}
 		}
 		return out

@@ -10,7 +10,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gate
 
 FROM gcr.io/distroless/static-debian12:nonroot AS gateway
 COPY --from=build /out/gateway /gateway
-COPY configs/gateway.yaml /etc/llm-gateway/gateway.yaml
+# gateway.yaml = local Ollama models; gateway.mock.yaml = bundled mock upstream
+COPY configs/gateway.yaml configs/gateway.mock.yaml /etc/llm-gateway/
 ENV LLMGW_CONFIG=/etc/llm-gateway/gateway.yaml
 EXPOSE 8080
 USER 65532:65532

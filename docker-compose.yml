@@ -11,7 +11,7 @@ services:
     ports: ["5432:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations/001_init_pgvector.sql:/docker-entrypoint-initdb.d/001_init_pgvector.sql:ro
+      - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U llmgw -d llmgateway"]
       interval: 3s
@@ -36,6 +36,11 @@ services:
   gateway:
     build: { context: ., target: gateway }
     environment:
+      # Mock upstream by default (no model downloads). For local Ollama models use
+      # LLMGW_GATEWAY_CONFIG=/etc/llm-gateway/gateway.yaml and
+      # LLMGW_OLLAMA_URL=http://host.docker.internal:11434.
+      LLMGW_CONFIG: ${LLMGW_GATEWAY_CONFIG:-/etc/llm-gateway/gateway.mock.yaml}
+      LLMGW_OLLAMA_URL: ${LLMGW_OLLAMA_URL:-http://host.docker.internal:11434}
       LLMGW_REDIS_ADDR: redis:6379
       LLMGW_POSTGRES_DSN: postgres://llmgw:llmgw@postgres:5432/llmgateway?sslmode=disable
       LLMGW_MOCKLLM_URL: http://mockllm:8090

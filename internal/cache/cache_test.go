@@ -287,7 +287,7 @@ func TestPGVectorStore(t *testing.T) {
 
 	// The HNSW index must be used for the similarity ORDER BY.
 	var plan string
-	rows, err := pool.Query(ctx, "EXPLAIN SELECT id FROM semantic_cache ORDER BY embedding <=> $1 LIMIT 1", fmt.Sprintf("[%s1]", strings.Repeat("0,", Dim-1)))
+	rows, err := pool.Query(ctx, "EXPLAIN SELECT id FROM semantic_cache WHERE dims = 384 ORDER BY embedding::vector(384) <=> $1::vector(384) LIMIT 1", fmt.Sprintf("[%s1]", strings.Repeat("0,", Dim-1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestPGVectorStore(t *testing.T) {
 		plan += line + "\n"
 	}
 	rows.Close()
-	if !strings.Contains(plan, "semantic_cache_embedding_hnsw") {
+	if !strings.Contains(plan, "semantic_cache_hnsw_d384") {
 		t.Logf("planner did not pick HNSW for tiny table (expected on small data):\n%s", plan)
 	}
 

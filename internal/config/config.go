@@ -93,12 +93,24 @@ type CacheConfig struct {
 	SimilarityThreshold float64       `yaml:"similarity_threshold"`
 	TTL                 time.Duration `yaml:"ttl"`
 	L1MaxEntries        int           `yaml:"l1_max_entries"`
-	Embedder            string        `yaml:"embedder"` // "hashing" | "openai"
-	EmbeddingURL        string        `yaml:"embedding_url"`
-	EmbeddingModel      string        `yaml:"embedding_model"`
-	EmbeddingAPIKeyEnv  string        `yaml:"embedding_api_key_env"`
-	WriteQueueSize      int           `yaml:"write_queue_size"`
-	WriteWorkers        int           `yaml:"write_workers"`
+	// Embedder: "hashing" (local, deterministic), "ollama" (e.g. nomic-embed-text
+	// via /api/embeddings, falls back to hashing when Ollama is unreachable),
+	// or "openai" (OpenAI-compatible /v1/embeddings).
+	Embedder           string `yaml:"embedder"`
+	EmbeddingURL       string `yaml:"embedding_url"`
+	EmbeddingModel     string `yaml:"embedding_model"`
+	EmbeddingAPIKeyEnv string `yaml:"embedding_api_key_env"`
+	// EmbeddingDimensions truncates (Matryoshka) and re-normalizes vectors;
+	// 0 keeps the model's native size (768 for nomic-embed-text).
+	EmbeddingDimensions int `yaml:"embedding_dimensions"`
+	// EmbeddingPrefix is prepended to every text (some models use task prefixes).
+	EmbeddingPrefix  string        `yaml:"embedding_prefix"`
+	EmbeddingTimeout time.Duration `yaml:"embedding_timeout"`
+	// FallbackSimilarityThreshold applies to entries embedded by the hashing
+	// fallback; SimilarityThreshold applies to the configured embedder.
+	FallbackSimilarityThreshold float64 `yaml:"fallback_similarity_threshold"`
+	WriteQueueSize              int     `yaml:"write_queue_size"`
+	WriteWorkers                int     `yaml:"write_workers"`
 }
 
 type ProviderConfig struct {
@@ -110,6 +122,9 @@ type ProviderConfig struct {
 	DefaultModel string            `yaml:"default_model"`
 	Query        map[string]string `yaml:"query"`
 	Headers      map[string]string `yaml:"headers"`
+	// ExtraBody fields are added to OpenAI-compatible request bodies unless the
+	// request sets them, e.g. {reasoning_effort: none} to disable "thinking".
+	ExtraBody map[string]any `yaml:"extra_body"`
 }
 
 type RouteTarget struct {
@@ -197,15 +212,17 @@ func Default() Config {
 		},
 		Guardrails: GuardrailsConfig{Enabled: true, InjectionThreshold: 0.7, ScanOutput: true},
 		Cache: CacheConfig{
-			Enabled:             true,
-			SimilarityThreshold: 0.86,
-			TTL:                 24 * time.Hour,
-			L1MaxEntries:        50000,
-			Embedder:            "hashing",
-			EmbeddingModel:      "text-embedding-3-small",
-			EmbeddingAPIKeyEnv:  "OPENAI_API_KEY",
-			WriteQueueSize:      4096,
-			WriteWorkers:        8,
+			Enabled:                     true,
+			SimilarityThreshold:         0.86,
+			TTL:                         24 * time.Hour,
+			L1MaxEntries:                50000,
+			Embedder:                    "hashing",
+			EmbeddingModel:              "text-embedding-3-small",
+			EmbeddingAPIKeyEnv:          "OPENAI_API_KEY",
+			EmbeddingTimeout:            2 * time.Second,
+			FallbackSimilarityThreshold: 0.86,
+			WriteQueueSize:              4096,
+			WriteWorkers:                8,
 		},
 		Breaker: BreakerConfig{
 			FailureThreshold:    0,
@@ -267,6 +284,16 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("LLMGW_CORS_ORIGINS"); ok {
 		cfg.Server.CORSOrigins = splitCSV(v)
 	}
+	// LLMGW_OLLAMA_URL rewrites Ollama endpoints (providers and the embedding
+	// URL) that point at http://localhost:11434, e.g. to
+	// http://host.docker.internal:11434 when the gateway runs in a container.
+	if v, ok := os.LookupEnv("LLMGW_OLLAMA_URL"); ok && v != "" {
+		v = strings.TrimRight(v, "/")
+		for i := range cfg.Providers {
+			cfg.Providers[i].BaseURL = strings.Replace(cfg.Providers[i].BaseURL, "http://localhost:11434", v, 1)
+		}
+		cfg.Cache.EmbeddingURL = strings.Replace(cfg.Cache.EmbeddingURL, "http://localhost:11434", v, 1)
+	}
 	// LLMGW_MOCKLLM_URL rewrites every provider base URL; convenient for
 	// docker-compose / k8s where all providers point at the mock.
 	if v, ok := os.LookupEnv("LLMGW_MOCKLLM_URL"); ok && v != "" {
@@ -317,6 +344,21 @@ func (c Config) Validate() error {
 	}
 	if c.Cache.SimilarityThreshold <= 0 || c.Cache.SimilarityThreshold > 1 {
 		return fmt.Errorf("cache.similarity_threshold must be in (0,1]")
+	}
+	if c.Cache.FallbackSimilarityThreshold < 0 || c.Cache.FallbackSimilarityThreshold > 1 {
+		return fmt.Errorf("cache.fallback_similarity_threshold must be in [0,1]")
+	}
+	switch c.Cache.Embedder {
+	case "", "hashing":
+	case "ollama", "openai":
+		if c.Cache.EmbeddingURL == "" || c.Cache.EmbeddingModel == "" {
+			return fmt.Errorf("cache.embedder %q requires embedding_url and embedding_model", c.Cache.Embedder)
+		}
+	default:
+		return fmt.Errorf("cache.embedder: unknown value %q (hashing | ollama | openai)", c.Cache.Embedder)
+	}
+	if c.Cache.EmbeddingDimensions < 0 {
+		return fmt.Errorf("cache.embedding_dimensions must be >= 0")
 	}
 	if c.Auth.JWTHMACSecret == "" && c.Auth.JWTRSAPublicKey == "" && c.Auth.JWKSURL == "" && len(c.Tenants) == 0 {
 		return fmt.Errorf("auth: configure a JWT key source or at least one API-key tenant")

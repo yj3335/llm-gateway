@@ -57,7 +57,7 @@ type chatRequest struct {
 
 // Exposed headers (CORS) for the control-plane playground.
 var exposedHeaders = strings.Join([]string{
-	"X-Request-ID", "X-Gateway-Cache", "X-Gateway-Cache-Similarity", "X-Gateway-Cache-Layer", "X-Gateway-Cache-Lookup-Ms",
+	"X-Request-ID", "X-Gateway-Cache", "X-Gateway-Cache-Similarity", "X-Gateway-Cache-Layer", "X-Gateway-Cache-Lookup-Ms", "X-Gateway-Embedder",
 	"X-Gateway-Provider", "X-Gateway-Provider-Failover", "X-Gateway-Upstream-Model", "X-Gateway-Attempts",
 	"X-Gateway-Upstream-Latency-Ms", "X-Gateway-Overhead-Ms", "X-Gateway-Total-Latency-Ms",
 	"X-Gateway-Guardrail", "X-Gateway-Guardrail-Categories", "X-Gateway-Tokens-Saved", "X-Gateway-Coalesced",
@@ -72,6 +72,7 @@ func (g *Gateway) Handler() http.Handler {
 		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_credentials", err.Error())
 	})
 	mux.Handle("POST /v1/chat/completions", authMW(http.HandlerFunc(g.chat)))
+	mux.Handle("POST /v1/embeddings", authMW(http.HandlerFunc(g.embeddings)))
 	mux.HandleFunc("GET /v1/models", g.models)
 	if g.tokenHandler != nil {
 		mux.Handle("POST /v1/auth/token", g.tokenHandler)
@@ -293,6 +294,9 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 	if !bypass {
 		res := g.Cache.Lookup(r.Context(), &key)
 		w.Header().Set("X-Gateway-Cache-Lookup-Ms", fmt.Sprintf("%.3f", ms(res.Elapsed)))
+		if res.Embedder != "" {
+			w.Header().Set("X-Gateway-Embedder", res.Embedder)
+		}
 		st.trace.CacheStatus = string(res.Status)
 		g.Metrics.CacheLookups.WithLabelValues(string(res.Status)).Inc()
 		if res.Entry != nil {
@@ -308,8 +312,13 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 
 	// ---- upstream ------------------------------------------------------------------
 	chaos := router.Chaos{}
-	if g.Cfg.Server.EnableChaosHeaders && r.Header.Get("X-Gateway-Chaos") == "fail-primary" {
-		chaos.FailPrimary = true
+	if g.Cfg.Server.EnableChaosHeaders {
+		switch r.Header.Get("X-Gateway-Chaos") {
+		case "fail-primary":
+			chaos.FailPrimary = true
+		case "timeout-primary":
+			chaos.TimeoutPrimary = true
+		}
 	}
 	if req.Stream {
 		used := g.stream(w, r, st, &req, key, bypass, chaos)
@@ -356,7 +365,7 @@ func (g *Gateway) complete(w http.ResponseWriter, r *http.Request, st *requestSt
 	var v any
 	var err error
 	var shared bool
-	if bypass || chaos.FailPrimary {
+	if bypass || chaos.FailPrimary || chaos.TimeoutPrimary {
 		v, err = call()
 	} else {
 		v, err, shared = g.sf.Do(key.ExactHash, call)
@@ -384,6 +393,7 @@ func (g *Gateway) complete(w http.ResponseWriter, r *http.Request, st *requestSt
 		Choices: []router.Choice{{Index: 0, Message: router.ChatMessage{Role: "assistant", Content: fr.content}, FinishReason: c.FinishReason}},
 		Usage:   c.Usage,
 	}
+	g.setProviderHeaders(w, fr.outcome)
 	g.setTimingHeaders(w, st)
 	w.Header().Set("Content-Type", "application/json")
 	st.trace.Status = http.StatusOK
@@ -767,4 +777,76 @@ func (s *sseWriter) done() {
 	}
 	_, _ = fmt.Fprint(s.w, "data: [DONE]\n\n")
 	s.f.Flush()
+}
+
+// embeddings serves an OpenAI-compatible POST /v1/embeddings using the
+// gateway's configured embedder (e.g. nomic-embed-text on local Ollama, with
+// the hashing fallback while Ollama is unreachable). The response reports the
+// model that actually produced the vectors.
+func (g *Gateway) embeddings(w http.ResponseWriter, r *http.Request) {
+	p, _ := auth.FromContext(r.Context())
+	if g.Cache == nil {
+		writeError(w, http.StatusNotImplemented, "invalid_request_error", "embeddings_disabled", "the semantic cache (and its embedder) is disabled")
+		return
+	}
+	var req struct {
+		Input json.RawMessage `json:"input"`
+		Model string          `json:"model"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, g.Cfg.Server.MaxBodyBytes)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "request body must be valid JSON: "+err.Error())
+		return
+	}
+	var inputs []string
+	var one string
+	if json.Unmarshal(req.Input, &one) == nil {
+		inputs = []string{one}
+	} else if err := json.Unmarshal(req.Input, &inputs); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_input", "input must be a string or an array of strings")
+		return
+	}
+	if len(inputs) == 0 || len(inputs) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_input", "input must contain 1 to 256 strings")
+		return
+	}
+	chars := 0
+	for _, in := range inputs {
+		if strings.TrimSpace(in) == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_input", "input strings must be non-empty")
+			return
+		}
+		chars += len(in)
+	}
+	if g.Limiter != nil {
+		res, err := g.Limiter.Allow(r.Context(), p.TenantID, ratelimit.Limits{RPM: p.RPMLimit, TPM: p.TPMLimit}, ratelimit.EstimateTokens(chars, 0))
+		if err == nil {
+			res.SetHeaders(w.Header())
+			if !res.Allowed {
+				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit", "rate limit exceeded")
+				return
+			}
+		}
+	}
+	type item struct {
+		Object    string    `json:"object"`
+		Index     int       `json:"index"`
+		Embedding []float32 `json:"embedding"`
+	}
+	data := make([]item, len(inputs))
+	model := ""
+	for i, in := range inputs {
+		v, name, err := g.Cache.Embed(r.Context(), in)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "upstream_error", "embedding_failed", err.Error())
+			return
+		}
+		data[i] = item{Object: "embedding", Index: i, Embedding: v}
+		model = name
+	}
+	w.Header().Set("X-Gateway-Embedder", model)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object": "list", "data": data, "model": model,
+		"usage": map[string]int{"prompt_tokens": (chars + 3) / 4, "total_tokens": (chars + 3) / 4},
+	})
 }
